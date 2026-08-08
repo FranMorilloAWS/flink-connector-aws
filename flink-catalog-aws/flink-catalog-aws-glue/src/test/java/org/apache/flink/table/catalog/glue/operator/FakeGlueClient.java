@@ -23,6 +23,8 @@ import software.amazon.awssdk.services.glue.model.AlreadyExistsException;
 import software.amazon.awssdk.services.glue.model.Column;
 import software.amazon.awssdk.services.glue.model.CreateDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.CreateDatabaseResponse;
+import software.amazon.awssdk.services.glue.model.CreatePartitionRequest;
+import software.amazon.awssdk.services.glue.model.CreatePartitionResponse;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
 import software.amazon.awssdk.services.glue.model.CreateTableResponse;
 import software.amazon.awssdk.services.glue.model.CreateUserDefinedFunctionRequest;
@@ -31,6 +33,8 @@ import software.amazon.awssdk.services.glue.model.Database;
 import software.amazon.awssdk.services.glue.model.DatabaseInput;
 import software.amazon.awssdk.services.glue.model.DeleteDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.DeleteDatabaseResponse;
+import software.amazon.awssdk.services.glue.model.DeletePartitionRequest;
+import software.amazon.awssdk.services.glue.model.DeletePartitionResponse;
 import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
 import software.amazon.awssdk.services.glue.model.DeleteTableResponse;
 import software.amazon.awssdk.services.glue.model.DeleteUserDefinedFunctionRequest;
@@ -40,6 +44,10 @@ import software.amazon.awssdk.services.glue.model.GetDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.GetDatabaseResponse;
 import software.amazon.awssdk.services.glue.model.GetDatabasesRequest;
 import software.amazon.awssdk.services.glue.model.GetDatabasesResponse;
+import software.amazon.awssdk.services.glue.model.GetPartitionRequest;
+import software.amazon.awssdk.services.glue.model.GetPartitionResponse;
+import software.amazon.awssdk.services.glue.model.GetPartitionsRequest;
+import software.amazon.awssdk.services.glue.model.GetPartitionsResponse;
 import software.amazon.awssdk.services.glue.model.GetTableRequest;
 import software.amazon.awssdk.services.glue.model.GetTableResponse;
 import software.amazon.awssdk.services.glue.model.GetTablesRequest;
@@ -48,8 +56,12 @@ import software.amazon.awssdk.services.glue.model.GetUserDefinedFunctionRequest;
 import software.amazon.awssdk.services.glue.model.GetUserDefinedFunctionResponse;
 import software.amazon.awssdk.services.glue.model.GetUserDefinedFunctionsRequest;
 import software.amazon.awssdk.services.glue.model.GetUserDefinedFunctionsResponse;
+import software.amazon.awssdk.services.glue.model.Partition;
+import software.amazon.awssdk.services.glue.model.PartitionInput;
 import software.amazon.awssdk.services.glue.model.StorageDescriptor;
 import software.amazon.awssdk.services.glue.model.Table;
+import software.amazon.awssdk.services.glue.model.UpdatePartitionRequest;
+import software.amazon.awssdk.services.glue.model.UpdatePartitionResponse;
 import software.amazon.awssdk.services.glue.model.UpdateUserDefinedFunctionRequest;
 import software.amazon.awssdk.services.glue.model.UpdateUserDefinedFunctionResponse;
 import software.amazon.awssdk.services.glue.model.UserDefinedFunction;
@@ -112,6 +124,97 @@ public class FakeGlueClient implements GlueClient {
         DATABASE_STORE.clear();
         tableStore.clear();
         functionStore.clear();
+        partitionStore.clear();
+    }
+
+    // Partition store: database -> table -> partition values -> Partition
+    private static final Map<String, Map<String, Map<List<String>, Partition>>> partitionStore =
+            new HashMap<>();
+
+    @Override
+    public GetPartitionsResponse getPartitions(GetPartitionsRequest request) {
+        throwNextExceptionIfExists();
+        Map<List<String>, Partition> partitions =
+                partitionStore
+                        .getOrDefault(request.databaseName(), Collections.emptyMap())
+                        .getOrDefault(request.tableName(), Collections.emptyMap());
+        return GetPartitionsResponse.builder()
+                .partitions(new ArrayList<>(partitions.values()))
+                .build();
+    }
+
+    @Override
+    public GetPartitionResponse getPartition(GetPartitionRequest request) {
+        throwNextExceptionIfExists();
+        Partition partition =
+                partitionStore
+                        .getOrDefault(request.databaseName(), Collections.emptyMap())
+                        .getOrDefault(request.tableName(), Collections.emptyMap())
+                        .get(request.partitionValues());
+        if (partition == null) {
+            throw EntityNotFoundException.builder().message("Partition not found").build();
+        }
+        return GetPartitionResponse.builder().partition(partition).build();
+    }
+
+    @Override
+    public CreatePartitionResponse createPartition(CreatePartitionRequest request) {
+        throwNextExceptionIfExists();
+        PartitionInput input = request.partitionInput();
+        Map<List<String>, Partition> tablePartitions =
+                partitionStore
+                        .computeIfAbsent(request.databaseName(), db -> new HashMap<>())
+                        .computeIfAbsent(request.tableName(), tbl -> new HashMap<>());
+        if (tablePartitions.containsKey(input.values())) {
+            throw AlreadyExistsException.builder().message("Partition already exists").build();
+        }
+        Partition partition =
+                Partition.builder()
+                        .databaseName(request.databaseName())
+                        .tableName(request.tableName())
+                        .values(input.values())
+                        .storageDescriptor(input.storageDescriptor())
+                        .parameters(input.parameters())
+                        .build();
+        tablePartitions.put(input.values(), partition);
+        return CreatePartitionResponse.builder().build();
+    }
+
+    @Override
+    public UpdatePartitionResponse updatePartition(UpdatePartitionRequest request) {
+        throwNextExceptionIfExists();
+        Map<List<String>, Partition> tablePartitions =
+                partitionStore
+                        .getOrDefault(request.databaseName(), Collections.emptyMap())
+                        .getOrDefault(request.tableName(), Collections.emptyMap());
+        if (!tablePartitions.containsKey(request.partitionValueList())) {
+            throw EntityNotFoundException.builder().message("Partition not found").build();
+        }
+        PartitionInput input = request.partitionInput();
+        Partition updated =
+                Partition.builder()
+                        .databaseName(request.databaseName())
+                        .tableName(request.tableName())
+                        .values(input.values())
+                        .storageDescriptor(input.storageDescriptor())
+                        .parameters(input.parameters())
+                        .build();
+        tablePartitions.remove(request.partitionValueList());
+        tablePartitions.put(input.values(), updated);
+        return UpdatePartitionResponse.builder().build();
+    }
+
+    @Override
+    public DeletePartitionResponse deletePartition(DeletePartitionRequest request) {
+        throwNextExceptionIfExists();
+        Map<List<String>, Partition> tablePartitions =
+                partitionStore
+                        .getOrDefault(request.databaseName(), Collections.emptyMap())
+                        .getOrDefault(request.tableName(), Collections.emptyMap());
+        if (tablePartitions.remove(request.partitionValues()) == null) {
+            throw EntityNotFoundException.builder().message("Partition not found").build();
+        }
+        return DeletePartitionResponse.builder().build();
     }
 
     @Override
@@ -216,6 +319,11 @@ public class FakeGlueClient implements GlueClient {
                         .parameters(request.tableInput().parameters())
                         .storageDescriptor(request.tableInput().storageDescriptor())
                         .description(request.tableInput().description());
+
+        // Persist partition keys like real Glue does (TableInput-level field)
+        if (request.tableInput().hasPartitionKeys()) {
+            tableBuilder.partitionKeys(request.tableInput().partitionKeys());
+        }
 
         // Add view-specific fields if present
         if (request.tableInput().viewOriginalText() != null) {

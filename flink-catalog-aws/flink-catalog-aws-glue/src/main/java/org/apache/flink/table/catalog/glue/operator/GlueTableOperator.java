@@ -256,16 +256,22 @@ public class GlueTableOperator extends GlueOperator {
     /**
      * Converts a Flink catalog table to Glue's TableInput object.
      *
-     * @param tableName The original table name (case will be preserved in metadata).
-     * @param glueColumns The list of columns for the table.
+     * <p>Partition columns are persisted at the {@code TableInput} level (Glue models partition
+     * keys separately from the storage descriptor columns), and the table comment is persisted as
+     * the Glue table description.
+     *
+     * @param tableName The name of the table.
+     * @param partitionColumns The Glue columns for the table's partition keys, in the order
+     *     declared by the Flink table (may be empty).
      * @param catalogTable The Flink CatalogTable containing the table schema.
-     * @param storageDescriptor The Glue storage descriptor for the table.
+     * @param storageDescriptor The Glue storage descriptor holding the data (non-partition)
+     *     columns.
      * @param properties The properties of the table.
      * @return The Glue TableInput object representing the table.
      */
     public TableInput buildTableInput(
             String tableName,
-            List<Column> glueColumns,
+            List<Column> partitionColumns,
             CatalogTable catalogTable,
             StorageDescriptor storageDescriptor,
             Map<String, String> properties) {
@@ -285,12 +291,25 @@ public class GlueTableOperator extends GlueOperator {
         // Store original table name in metadata
         tableParameters.put(GlueCatalogConstants.ORIGINAL_TABLE_NAME, tableName);
 
-        return TableInput.builder()
-                .name(glueTableName)
-                .storageDescriptor(storageDescriptor)
-                .parameters(tableParameters)
-                .tableType(catalogTable.getTableKind().name())
-                .build();
+        TableInput.Builder builder =
+                TableInput.builder()
+                        .name(glueTableName)
+                        .storageDescriptor(storageDescriptor)
+                        .parameters(tableParameters)
+                        .tableType(catalogTable.getTableKind().name());
+
+        // Persist partition keys at the TableInput level so partition metadata declared
+        // in DDL survives the round-trip (Glue stores them outside the storage descriptor).
+        if (partitionColumns != null && !partitionColumns.isEmpty()) {
+            builder.partitionKeys(partitionColumns);
+        }
+
+        // Persist the table comment as the Glue description.
+        if (catalogTable.getComment() != null) {
+            builder.description(catalogTable.getComment());
+        }
+
+        return builder.build();
     }
 
     /**
