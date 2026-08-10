@@ -735,8 +735,73 @@ public class GlueCatalog extends AbstractCatalog {
     @Override
     public void alterTable(ObjectPath objectPath, CatalogBaseTable catalogBaseTable, boolean b)
             throws TableNotExistException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Altering tables is not supported by the Glue Catalog.");
+        Preconditions.checkNotNull(objectPath, "ObjectPath cannot be null");
+        Preconditions.checkNotNull(catalogBaseTable, "CatalogBaseTable cannot be null");
+
+        // Resolve Glue storage names with the same case-insensitive resolution as getTable.
+        String glueDatabaseName = findGlueDatabaseName(objectPath.getDatabaseName());
+        String glueTableName =
+                glueDatabaseName == null
+                        ? null
+                        : findGlueTableName(glueDatabaseName, objectPath.getObjectName());
+        if (glueTableName == null) {
+            if (b) {
+                return;
+            }
+            throw new TableNotExistException(getName(), objectPath);
+        }
+
+        if (catalogBaseTable.getTableKind() != CatalogBaseTable.TableKind.TABLE) {
+            throw new UnsupportedOperationException(
+                    "Altering non-TABLE objects is not supported by the Glue Catalog.");
+        }
+
+        // Preserve the originally declared table name (case) across the alter.
+        Table existingTable = glueTableOperations.getGlueTable(glueDatabaseName, glueTableName);
+        String originalTableName = glueTableOperations.getOriginalTableName(existingTable);
+
+        CatalogTable catalogTable = (CatalogTable) catalogBaseTable;
+        Map<String, String> tableProperties = new HashMap<>(catalogTable.getOptions());
+        String tableLocation = glueTableUtils.extractTableLocation(tableProperties, objectPath);
+
+        ResolvedCatalogBaseTable<?> resolvedTable = (ResolvedCatalogBaseTable<?>) catalogTable;
+        List<String> partitionKeys = catalogTable.getPartitionKeys();
+
+        List<software.amazon.awssdk.services.glue.model.Column> dataColumns = new ArrayList<>();
+        Map<String, software.amazon.awssdk.services.glue.model.Column> partitionColumnsByName =
+                new HashMap<>();
+        for (org.apache.flink.table.catalog.Column flinkColumn :
+                resolvedTable.getResolvedSchema().getColumns()) {
+            software.amazon.awssdk.services.glue.model.Column glueColumn =
+                    glueTableUtils.mapFlinkColumnToGlueColumn(flinkColumn);
+            if (partitionKeys.contains(flinkColumn.getName())) {
+                partitionColumnsByName.put(flinkColumn.getName(), glueColumn);
+            } else {
+                dataColumns.add(glueColumn);
+            }
+        }
+        List<software.amazon.awssdk.services.glue.model.Column> partitionColumns =
+                partitionKeys.stream()
+                        .map(partitionColumnsByName::get)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+
+        StorageDescriptor storageDescriptor =
+                glueTableUtils.buildStorageDescriptor(tableProperties, dataColumns, tableLocation);
+
+        TableInput tableInput =
+                glueTableOperations.buildTableInput(
+                        originalTableName,
+                        partitionColumns,
+                        catalogTable,
+                        storageDescriptor,
+                        tableProperties);
+
+        glueTableOperations.updateTable(glueDatabaseName, tableInput);
+        LOG.info(
+                "Successfully altered {}.{}",
+                objectPath.getDatabaseName(),
+                objectPath.getObjectName());
     }
 
     @Override
@@ -963,9 +1028,8 @@ public class GlueCatalog extends AbstractCatalog {
         }
 
         private List<String> partitionKeys() {
-            return glueTable.partitionKeys().stream()
-                    .map(software.amazon.awssdk.services.glue.model.Column::name)
-                    .collect(Collectors.toList());
+            return org.apache.flink.table.catalog.glue.util.GlueTableUtils.getPartitionKeyNames(
+                    glueTable);
         }
     }
 
@@ -1353,13 +1417,10 @@ public class GlueCatalog extends AbstractCatalog {
             // Parse schema from Glue table structure
             Schema schemaInfo = glueTableUtils.getSchemaFromGlueTable(glueTable);
 
-            // Extract partition keys
+            // Extract partition keys (restoring original case from table parameters)
             List<String> partitionKeys =
-                    glueTable.partitionKeys() != null
-                            ? glueTable.partitionKeys().stream()
-                                    .map(software.amazon.awssdk.services.glue.model.Column::name)
-                                    .collect(Collectors.toList())
-                            : Collections.emptyList();
+                    org.apache.flink.table.catalog.glue.util.GlueTableUtils.getPartitionKeyNames(
+                            glueTable);
 
             // Collect all properties
             Map<String, String> properties = new HashMap<>();
@@ -1370,7 +1431,8 @@ public class GlueCatalog extends AbstractCatalog {
                     String key = entry.getKey();
                     // Filter out our internal metadata parameters
                     if (!GlueCatalogConstants.ORIGINAL_TABLE_NAME.equals(key)
-                            && !GlueCatalogConstants.ORIGINAL_DATABASE_NAME.equals(key)) {
+                            && !GlueCatalogConstants.ORIGINAL_DATABASE_NAME.equals(key)
+                            && !GlueCatalogConstants.ORIGINAL_PARTITION_KEYS.equals(key)) {
                         properties.put(key, entry.getValue());
                     }
                 }

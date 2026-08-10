@@ -23,6 +23,7 @@ import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.table.catalog.glue.util.GlueCatalogConstants;
+import org.apache.flink.table.catalog.glue.util.GlueTableUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +42,8 @@ import software.amazon.awssdk.services.glue.model.GlueException;
 import software.amazon.awssdk.services.glue.model.StorageDescriptor;
 import software.amazon.awssdk.services.glue.model.Table;
 import software.amazon.awssdk.services.glue.model.TableInput;
+import software.amazon.awssdk.services.glue.model.UpdateTableRequest;
+import software.amazon.awssdk.services.glue.model.UpdateTableResponse;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -184,7 +187,6 @@ public class GlueTableOperator extends GlueOperator {
                 throw new CatalogException(
                         "Error creating table: " + databaseName + "." + tableInput.name());
             }
-
             // Log both original and storage names for clarity
             String originalTableName =
                     tableInput.parameters() != null
@@ -198,6 +200,36 @@ public class GlueTableOperator extends GlueOperator {
             throw new CatalogException("Table already exists: " + e.getMessage(), e);
         } catch (GlueException e) {
             throw new CatalogException("Error creating table: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Updates an existing table in Glue via UpdateTable. The TableInput's name must be the Glue
+     * storage name (lowercase) of the existing table.
+     *
+     * @param databaseName The Glue storage name of the database containing the table.
+     * @param tableInput The full replacement definition of the table.
+     * @throws CatalogException if there is an error updating the table.
+     */
+    public void updateTable(String databaseName, TableInput tableInput) {
+        try {
+            UpdateTableRequest request =
+                    UpdateTableRequest.builder()
+                            .databaseName(databaseName)
+                            .tableInput(tableInput)
+                            .build();
+            UpdateTableResponse response = glueClient.updateTable(request);
+            if (response == null
+                    || (response.sdkHttpResponse() != null
+                            && !response.sdkHttpResponse().isSuccessful())) {
+                throw new CatalogException(
+                        "Error updating table: " + databaseName + "." + tableInput.name());
+            }
+            LOG.info("Updated table '{}.{}' in Glue", databaseName, tableInput.name());
+        } catch (EntityNotFoundException e) {
+            throw new CatalogException("Table does not exist: " + e.getMessage(), e);
+        } catch (GlueException e) {
+            throw new CatalogException("Error updating table: " + e.getMessage(), e);
         }
     }
 
@@ -291,6 +323,34 @@ public class GlueTableOperator extends GlueOperator {
         // Store original table name in metadata
         tableParameters.put(GlueCatalogConstants.ORIGINAL_TABLE_NAME, tableName);
 
+        // Glue rejects column-level parameters on partition columns, so the originalName
+        // column parameter cannot be used for them. Strip any parameters and preserve the
+        // declared partition-key case in an order-preserving table-level parameter instead.
+        List<Column> sanitizedPartitionColumns = null;
+        if (partitionColumns != null && !partitionColumns.isEmpty()) {
+            List<String> originalPartitionKeys = new ArrayList<>();
+            sanitizedPartitionColumns = new ArrayList<>(partitionColumns.size());
+            boolean anyMixedCase = false;
+            for (Column partitionColumn : partitionColumns) {
+                String originalName = GlueTableUtils.getColumnName(partitionColumn);
+                originalPartitionKeys.add(originalName);
+                if (!originalName.equals(partitionColumn.name())) {
+                    anyMixedCase = true;
+                }
+                sanitizedPartitionColumns.add(
+                        Column.builder()
+                                .name(partitionColumn.name())
+                                .type(partitionColumn.type())
+                                .comment(partitionColumn.comment())
+                                .build());
+            }
+            if (anyMixedCase) {
+                tableParameters.put(
+                        GlueCatalogConstants.ORIGINAL_PARTITION_KEYS,
+                        String.join(",", originalPartitionKeys));
+            }
+        }
+
         TableInput.Builder builder =
                 TableInput.builder()
                         .name(glueTableName)
@@ -300,8 +360,8 @@ public class GlueTableOperator extends GlueOperator {
 
         // Persist partition keys at the TableInput level so partition metadata declared
         // in DDL survives the round-trip (Glue stores them outside the storage descriptor).
-        if (partitionColumns != null && !partitionColumns.isEmpty()) {
-            builder.partitionKeys(partitionColumns);
+        if (sanitizedPartitionColumns != null && !sanitizedPartitionColumns.isEmpty()) {
+            builder.partitionKeys(sanitizedPartitionColumns);
         }
 
         // Persist the table comment as the Glue description.

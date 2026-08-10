@@ -50,6 +50,15 @@ public class GlueCatalogConstants {
 
     public static final String ORIGINAL_COLUMN_NAME =
             "originalName"; // Keep existing for backward compatibility
+
+    /**
+     * Table-level parameter carrying the comma-separated, order-preserving original (declared)
+     * names of the partition keys. Needed because AWS Glue rejects column-level parameters on
+     * partition columns ("Parameters not supported for partition columns"), so the originalName
+     * column-parameter mechanism cannot be used for them.
+     */
+    public static final String ORIGINAL_PARTITION_KEYS = "flink.original-partition-keys";
+
     public static final String ORIGINAL_FUNCTION_NAME = "flink.original-function-name";
 
     public static final String FLINK_SCALA_FUNCTION_PREFIX = "flink:scala:";
