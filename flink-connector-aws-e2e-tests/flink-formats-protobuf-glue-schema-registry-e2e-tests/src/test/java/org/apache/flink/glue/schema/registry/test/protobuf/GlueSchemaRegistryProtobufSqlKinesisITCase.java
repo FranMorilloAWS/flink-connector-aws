@@ -326,8 +326,8 @@ class GlueSchemaRegistryProtobufSqlKinesisITCase {
         sb.append("  'aws.region' = '").append(KINESIS_REGION).append("',");
         sb.append("  'aws.endpoint' = '").append(MOCK_KINESIS_CONTAINER.getEndpoint()).append("',");
         sb.append("  'aws.credentials.provider' = 'BASIC',");
-        sb.append("  'aws.credentials.provider.basic.accesskeyid' = 'accessKeyId',");
-        sb.append("  'aws.credentials.provider.basic.secretkey' = 'secretAccessKey',");
+        sb.append("  'aws.credentials.basic.accesskeyid' = 'accessKeyId',");
+        sb.append("  'aws.credentials.basic.secretkey' = 'secretAccessKey',");
         sb.append("  'aws.trust.all.certificates' = 'true'");
         if (source) {
             sb.append(",  'source.init.position' = 'TRIM_HORIZON'");
