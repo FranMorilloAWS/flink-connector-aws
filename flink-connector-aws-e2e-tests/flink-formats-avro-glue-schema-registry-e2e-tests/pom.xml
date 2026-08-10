@@ -82,6 +82,13 @@ under the License.
             <artifactId>netty-nio-client</artifactId>
         </dependency>
 
+        <!-- AWS SDK S3 (needed by LocalstackContainer startup, declared provided by connector) -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Flink AWS base (provides AWSGeneralUtil, declared provided by connector) -->
         <dependency>
             <groupId>org.apache.flink</groupId>

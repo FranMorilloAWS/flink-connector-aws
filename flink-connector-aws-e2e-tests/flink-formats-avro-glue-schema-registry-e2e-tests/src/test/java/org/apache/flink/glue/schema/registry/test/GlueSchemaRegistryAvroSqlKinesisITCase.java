@@ -437,8 +437,8 @@ class GlueSchemaRegistryAvroSqlKinesisITCase {
         with.add("'aws.region' = '" + KINESIS_REGION + "'");
         with.add("'aws.endpoint' = '" + LOCALSTACK.getEndpoint() + "'");
         with.add("'aws.credentials.provider' = 'BASIC'");
-        with.add("'aws.credentials.provider.basic.accesskeyid' = 'accessKeyId'");
-        with.add("'aws.credentials.provider.basic.secretkey' = 'secretAccessKey'");
+        with.add("'aws.credentials.basic.accesskeyid' = 'accessKeyId'");
+        with.add("'aws.credentials.basic.secretkey' = 'secretAccessKey'");
         with.add("'aws.trust.all.certificates' = 'true'");
         with.add("'aws.http.protocol.version' = 'HTTP1_1'");
         if (source) {
