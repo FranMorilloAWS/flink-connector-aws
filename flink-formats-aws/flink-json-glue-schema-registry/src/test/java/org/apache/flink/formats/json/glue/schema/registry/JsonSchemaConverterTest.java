@@ -86,6 +86,10 @@ class JsonSchemaConverterTest {
         String schema = JsonSchemaConverter.convertToJsonSchema(rowType);
 
         assertThat(schema).contains("\"$schema\":\"http://json-schema.org/draft-07/schema#\"");
+        // Closed content model: without additionalProperties:false, GSR's BACKWARD
+        // compatibility check rejects any added property, blocking schema evolution.
+        assertThat(schema)
+                .contains("\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
         assertThat(schema).contains("\"s\":{\"type\":\"string\"}");
         assertThat(schema).contains("\"i\":{\"type\":\"integer\"}");
         assertThat(schema).contains("\"d\":{\"type\":\"number\"}");
@@ -157,7 +161,7 @@ class JsonSchemaConverterTest {
         String schema = JsonSchemaConverter.convertToJsonSchema(rowType);
         assertThat(schema)
                 .contains(
-                        "\"addr\":{\"type\":\"object\",\"properties\":{\"street\":{\"type\":\"string\"}}");
+                        "\"addr\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"street\":{\"type\":\"string\"}}");
     }
 
     @Test

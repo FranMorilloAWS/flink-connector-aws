@@ -62,6 +62,11 @@ import java.util.StringJoiner;
  *       "contentEncoding":"base64"} rather than an untyped {@code "string"}.
  *   <li>A {@code "required"} array is emitted for {@code NOT NULL} fields so nullability is
  *       expressed rather than universally widened.
+ *   <li>Object nodes (top-level and nested ROWs) emit {@code "additionalProperties":false}. With an
+ *       open content model, GSR's server-side BACKWARD compatibility check rejects <em>any</em>
+ *       added property (old data could already carry that property name with an arbitrary type),
+ *       making schema evolution impossible. The closed model makes add-nullable-field evolution
+ *       pass the check, verified against real GSR.
  *   <li>The brittle {@code indexOf}/{@code substring} re-parse of just-built type JSON is gone;
  *       nullability is composed directly.
  * </ul>
@@ -92,7 +97,7 @@ public class JsonSchemaConverter {
         if (topLevel) {
             sb.append("\"$schema\":\"http://json-schema.org/draft-07/schema#\",");
         }
-        sb.append("\"type\":\"object\",\"properties\":{");
+        sb.append("\"type\":\"object\",\"additionalProperties\":false,\"properties\":{");
         StringJoiner props = new StringJoiner(",");
         StringJoiner required = new StringJoiner(",");
         for (RowType.RowField field : rowType.getFields()) {
