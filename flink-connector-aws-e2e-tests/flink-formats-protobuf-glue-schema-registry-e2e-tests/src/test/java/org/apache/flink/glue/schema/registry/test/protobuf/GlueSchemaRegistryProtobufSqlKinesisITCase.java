@@ -328,7 +328,8 @@ class GlueSchemaRegistryProtobufSqlKinesisITCase {
         sb.append("  'aws.credentials.provider' = 'BASIC',");
         sb.append("  'aws.credentials.basic.accesskeyid' = 'accessKeyId',");
         sb.append("  'aws.credentials.basic.secretkey' = 'secretAccessKey',");
-        sb.append("  'aws.trust.all.certificates' = 'true'");
+        sb.append("  'aws.trust.all.certificates' = 'true',");
+        sb.append("  'aws.http.protocol.version' = 'HTTP1_1'");
         if (source) {
             sb.append(",  'source.init.position' = 'TRIM_HORIZON'");
         }
