@@ -427,6 +427,79 @@ class GlueSchemaRegistryAvroSqlKinesisITCase {
                 .await(120, TimeUnit.SECONDS);
     }
 
+    @Test
+    void existingSchemaWithoutAutoRegistration() throws Exception {
+        String schemaName = schemaName("existing-no-autoreg");
+        String columns = "user_name STRING, favorite_number INT, favorite_color STRING";
+
+        // Phase A: register the schema (and a first version) by writing through a table that
+        // auto-registers it. This mirrors a one-time governed schema-onboarding step.
+        String seedStreamArn = createStream("gsr_avro_sql_existing_seed");
+        createKinesisTable(
+                "existing_seed_sink",
+                columns,
+                seedStreamArn,
+                false,
+                autoRegOpts(schemaName, "avro-glue.schema.autoRegistration", "true"));
+        tEnv.executeSql(
+                        "INSERT INTO existing_seed_sink VALUES "
+                                + "('Heidi', 11, 'teal'),"
+                                + "('Ivan', 22, 'olive')")
+                .await(120, TimeUnit.SECONDS);
+
+        // Phase B: a NEW stream for isolation, SAME schema name, but autoRegistration=false. The
+        // write must succeed because the schema and a compatible version already exist in GSR —
+        // this is the production governance pattern where apps are forbidden from registering.
+        String prodStreamArn = createStream("gsr_avro_sql_existing_prod");
+        createKinesisTable(
+                "existing_prod_sink",
+                columns,
+                prodStreamArn,
+                false,
+                autoRegOpts(schemaName, "avro-glue.schema.autoRegistration", "false"));
+        tEnv.executeSql(
+                        "INSERT INTO existing_prod_sink VALUES "
+                                + "('Judy', 33, 'maroon'),"
+                                + "('Mallory', 44, 'navy')")
+                .await(120, TimeUnit.SECONDS);
+
+        createKinesisTable(
+                "existing_prod_source", columns, prodStreamArn, true, sourceOpts(schemaName));
+        List<Row> rows = collect("SELECT * FROM existing_prod_source", 2, Duration.ofSeconds(90));
+
+        assertThat(firstFieldStrings(rows))
+                .as(
+                        "rows written against a pre-existing schema without auto-registration must"
+                                + " round-trip")
+                .contains("Judy", "Mallory");
+    }
+
+    @Test
+    void missingSchemaWithoutAutoRegistrationFails() throws Exception {
+        String streamArn = createStream("gsr_avro_sql_missing");
+        String schemaName = schemaName("missing-no-autoreg");
+        String columns = "user_name STRING, favorite_number INT, favorite_color STRING";
+
+        // The schema name has never been registered and autoRegistration is off, so the write must
+        // fail with a clear error rather than silently creating the schema.
+        createKinesisTable(
+                "missing_sink",
+                columns,
+                streamArn,
+                false,
+                autoRegOpts(schemaName, "avro-glue.schema.autoRegistration", "false"));
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                "INSERT INTO missing_sink VALUES ('Oscar', 1,"
+                                                        + " 'gray')")
+                                        .await(120, TimeUnit.SECONDS))
+                .as(
+                        "writing against a missing schema without auto-registration must fail with"
+                                + " a clear error rather than silently creating the schema")
+                .isInstanceOf(Exception.class);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
