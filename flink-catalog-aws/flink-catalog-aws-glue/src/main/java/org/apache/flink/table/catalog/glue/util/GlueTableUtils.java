@@ -101,9 +101,20 @@ public class GlueTableUtils {
     public Column mapFlinkColumnToGlueColumn(org.apache.flink.table.catalog.Column flinkColumn) {
         String glueType = glueTypeConverter.toGlueDataType(flinkColumn.getDataType());
 
-        // Preserve the original column name: Glue supports mixed-case column names, and
-        // force-lowercasing breaks case-sensitive downstream engines.
-        return Column.builder().name(flinkColumn.getName()).type(glueType).build();
+        // AWS Glue lowercases column names on CreateTable/UpdateTable (verified empirically:
+        // a column created as "userId" is stored and returned as "userid"). To preserve the
+        // declared case, store the lowercased name explicitly and stash the original name in
+        // the "originalName" column parameter, which the read path restores.
+        String originalName = flinkColumn.getName();
+        String glueName = originalName.toLowerCase();
+
+        Column.Builder builder = Column.builder().name(glueName).type(glueType);
+        if (!glueName.equals(originalName)) {
+            builder.parameters(
+                    Collections.singletonMap(
+                            GlueCatalogConstants.ORIGINAL_COLUMN_NAME, originalName));
+        }
+        return builder.build();
     }
 
     /**
@@ -127,26 +138,81 @@ public class GlueTableUtils {
         }
 
         // Partition columns live in Table.partitionKeys(), not in the storage descriptor.
-        if (glueTable.partitionKeys() != null) {
-            for (Column partitionColumn : glueTable.partitionKeys()) {
-                addGlueColumnToSchema(partitionColumn, schemaBuilder);
+        // Their declared case is restored from the table-level parameter (Glue rejects
+        // column-level parameters on partition columns).
+        if (glueTable.partitionKeys() != null && !glueTable.partitionKeys().isEmpty()) {
+            List<String> partitionKeyNames = getPartitionKeyNames(glueTable);
+            List<Column> partitionColumns = glueTable.partitionKeys();
+            for (int i = 0; i < partitionColumns.size(); i++) {
+                Column partitionColumn = partitionColumns.get(i);
+                DataType flinkDataType = glueTypeConverter.toFlinkDataType(partitionColumn.type());
+                schemaBuilder.column(partitionKeyNames.get(i), flinkDataType);
             }
         }
 
         return schemaBuilder.build();
     }
 
-    private void addGlueColumnToSchema(Column column, Schema.Builder schemaBuilder) {
-        String columnName = column.name();
-
-        // Backwards compatibility: tables written by older versions of this catalog were
-        // stored with lowercased names and the original name stashed in an "originalName"
-        // column parameter. Honor it on read so existing tables keep their declared names.
-        if (column.parameters() != null && column.parameters().containsKey("originalName")) {
-            columnName = column.parameters().get("originalName");
+    /**
+     * Returns the Flink-facing partition key names of a Glue table, in declared order. The original
+     * (case-preserved) names come from the table-level {@link
+     * GlueCatalogConstants#ORIGINAL_PARTITION_KEYS} parameter when present (written by this catalog
+     * because Glue rejects column-level parameters on partition columns), falling back to the
+     * per-column resolution for tables written by other writers or older versions.
+     *
+     * @param glueTable The Glue table.
+     * @return Ordered partition key names to expose to Flink; empty when not partitioned.
+     */
+    public static List<String> getPartitionKeyNames(Table glueTable) {
+        if (glueTable.partitionKeys() == null || glueTable.partitionKeys().isEmpty()) {
+            return Collections.emptyList();
         }
+        List<Column> partitionColumns = glueTable.partitionKeys();
+        if (glueTable.parameters() != null
+                && glueTable
+                        .parameters()
+                        .containsKey(GlueCatalogConstants.ORIGINAL_PARTITION_KEYS)) {
+            String[] originalNames =
+                    glueTable
+                            .parameters()
+                            .get(GlueCatalogConstants.ORIGINAL_PARTITION_KEYS)
+                            .split(",", -1);
+            if (originalNames.length == partitionColumns.size()) {
+                return java.util.Arrays.asList(originalNames);
+            }
+            LOG.warn(
+                    "Ignoring malformed {} parameter on table {}: {} entries for {} partition keys",
+                    GlueCatalogConstants.ORIGINAL_PARTITION_KEYS,
+                    glueTable.name(),
+                    originalNames.length,
+                    partitionColumns.size());
+        }
+        List<String> names = new java.util.ArrayList<>(partitionColumns.size());
+        for (Column partitionColumn : partitionColumns) {
+            names.add(getColumnName(partitionColumn));
+        }
+        return names;
+    }
 
+    private void addGlueColumnToSchema(Column column, Schema.Builder schemaBuilder) {
+        String columnName = getColumnName(column);
         DataType flinkDataType = glueTypeConverter.toFlinkDataType(column.type());
         schemaBuilder.column(columnName, flinkDataType);
+    }
+
+    /**
+     * Returns the Flink-facing name of a Glue column: the original (case-preserved) name from the
+     * "originalName" column parameter when present, otherwise the Glue-stored name. Glue lowercases
+     * column names on write, so this parameter is how the declared case survives the round-trip.
+     *
+     * @param column The Glue column.
+     * @return The column name to expose to Flink.
+     */
+    public static String getColumnName(Column column) {
+        if (column.parameters() != null
+                && column.parameters().containsKey(GlueCatalogConstants.ORIGINAL_COLUMN_NAME)) {
+            return column.parameters().get(GlueCatalogConstants.ORIGINAL_COLUMN_NAME);
+        }
+        return column.name();
     }
 }

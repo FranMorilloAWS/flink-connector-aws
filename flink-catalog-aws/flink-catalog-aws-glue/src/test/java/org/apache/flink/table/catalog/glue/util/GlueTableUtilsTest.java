@@ -157,25 +157,34 @@ class GlueTableUtilsTest {
         Column glueMixedCase = glueTableUtils.mapFlinkColumnToGlueColumn(mixedCaseColumn);
         Column glueLowerCase = glueTableUtils.mapFlinkColumnToGlueColumn(lowerCaseColumn);
 
-        // 3. Verify that Glue column names preserve the declared case
+        // 3. Verify Glue column names are stored lowercase (Glue lowercases on write, so we
+        // store lowercase deterministically) with the original case in the parameters.
         Assertions.assertEquals(
-                "UpperCaseColumn",
+                "uppercasecolumn",
                 glueUpperCase.name(),
-                "Glue column name should preserve original case");
+                "Glue column name should be stored lowercase");
         Assertions.assertEquals(
-                "mixedCaseColumn",
+                "mixedcasecolumn",
                 glueMixedCase.name(),
-                "Glue column name should preserve original case");
+                "Glue column name should be stored lowercase");
         Assertions.assertEquals(
                 "lowercase_column",
                 glueLowerCase.name(),
-                "Glue column name should preserve original case");
+                "Glue column name should be stored lowercase");
 
-        // 4. Verify no originalName side-channel parameter is written anymore
+        // 4. Verify the originalName parameter carries the declared case (only when needed)
+        Assertions.assertEquals(
+                "UpperCaseColumn",
+                glueUpperCase.parameters().get("originalName"),
+                "originalName parameter should preserve the declared case");
+        Assertions.assertEquals(
+                "mixedCaseColumn",
+                glueMixedCase.parameters().get("originalName"),
+                "originalName parameter should preserve the declared case");
         Assertions.assertFalse(
-                glueUpperCase.parameters() != null
-                        && glueUpperCase.parameters().containsKey("originalName"),
-                "originalName side-channel parameter should no longer be written");
+                glueLowerCase.parameters() != null
+                        && glueLowerCase.parameters().containsKey("originalName"),
+                "already-lowercase columns need no originalName parameter");
 
         // 5. Create a Glue table with these columns
         List<Column> glueColumns = Arrays.asList(glueUpperCase, glueMixedCase, glueLowerCase);
@@ -223,15 +232,22 @@ class GlueTableUtilsTest {
                         .map(glueTableUtils::mapFlinkColumnToGlueColumn)
                         .collect(Collectors.toList());
 
-        // 3. Verify Glue columns preserve the declared case directly (no side-channel)
+        // 3. Verify Glue columns are stored lowercase (real Glue lowercases on write) with the
+        // declared case preserved via the originalName parameter.
         for (int i = 0; i < flinkColumns.size(); i++) {
             String originalName = flinkColumns.get(i).getName();
-            String glueName = glueColumns.get(i).name();
+            Column glueColumn = glueColumns.get(i);
 
             Assertions.assertEquals(
-                    originalName,
-                    glueName,
-                    "Glue column name should preserve the original case directly");
+                    originalName.toLowerCase(),
+                    glueColumn.name(),
+                    "Glue column name should be stored lowercase");
+            if (!originalName.equals(originalName.toLowerCase())) {
+                Assertions.assertEquals(
+                        originalName,
+                        glueColumn.parameters().get("originalName"),
+                        "originalName parameter should preserve the declared case");
+            }
         }
 
         // 4. Create a Glue table with these columns (simulating storage in Glue)
