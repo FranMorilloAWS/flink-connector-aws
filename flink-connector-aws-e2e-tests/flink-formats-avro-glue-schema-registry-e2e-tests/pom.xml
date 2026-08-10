@@ -124,6 +124,13 @@ under the License.
             <scope>test</scope>
         </dependency>
 
+        <!-- Testcontainers Localstack for the SQL-path e2e ITCase -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>localstack</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Logging -->
         <dependency>
             <groupId>org.slf4j</groupId>
