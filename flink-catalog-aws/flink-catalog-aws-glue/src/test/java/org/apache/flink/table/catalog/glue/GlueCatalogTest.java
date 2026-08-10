@@ -25,6 +25,9 @@ import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogDatabaseImpl;
 import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.CatalogFunctionImpl;
+import org.apache.flink.table.catalog.CatalogPartition;
+import org.apache.flink.table.catalog.CatalogPartitionImpl;
+import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.CatalogView;
 import org.apache.flink.table.catalog.FunctionLanguage;
@@ -38,8 +41,12 @@ import org.apache.flink.table.catalog.exceptions.DatabaseNotEmptyException;
 import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
 import org.apache.flink.table.catalog.exceptions.FunctionAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.FunctionNotExistException;
+import org.apache.flink.table.catalog.exceptions.PartitionAlreadyExistsException;
+import org.apache.flink.table.catalog.exceptions.PartitionNotExistException;
+import org.apache.flink.table.catalog.exceptions.PartitionSpecInvalidException;
 import org.apache.flink.table.catalog.exceptions.TableAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
+import org.apache.flink.table.catalog.exceptions.TableNotPartitionedException;
 import org.apache.flink.table.catalog.glue.operator.FakeGlueClient;
 import org.apache.flink.table.catalog.glue.operator.GlueDatabaseOperator;
 import org.apache.flink.table.catalog.glue.operator.GlueTableOperator;
@@ -49,7 +56,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -930,5 +940,142 @@ public class GlueCatalogTest {
                         .build();
         ResolvedSchema resolvedSchema = ResolvedSchema.of();
         return new ResolvedCatalogTable(catalogTable, resolvedSchema);
+    }
+
+    // ==================== Partition support (review findings B2 / G1) ====================
+
+    private ObjectPath createPartitionedTable(String databaseName, String tableName)
+            throws Exception {
+        glueCatalog.createDatabase(
+                databaseName,
+                new CatalogDatabaseImpl(Collections.emptyMap(), "partition test db"),
+                true);
+
+        ResolvedSchema resolvedSchema =
+                ResolvedSchema.of(
+                        org.apache.flink.table.catalog.Column.physical("id", DataTypes.INT()),
+                        org.apache.flink.table.catalog.Column.physical(
+                                "region", DataTypes.STRING()));
+        CatalogTable catalogTable =
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().fromResolvedSchema(resolvedSchema).build())
+                        .comment("partitioned table comment")
+                        .partitionKeys(Collections.singletonList("region"))
+                        .options(Collections.emptyMap())
+                        .build();
+        ObjectPath tablePath = new ObjectPath(databaseName, tableName);
+        glueCatalog.createTable(
+                tablePath, new ResolvedCatalogTable(catalogTable, resolvedSchema), false);
+        return tablePath;
+    }
+
+    /** Regression test for finding B2: partition keys and comment must survive a round-trip. */
+    @Test
+    public void testCreateTablePersistsPartitionKeysAndComment() throws Exception {
+        ObjectPath tablePath = createPartitionedTable("ptndb", "ptntable");
+
+        CatalogBaseTable retrieved = glueCatalog.getTable(tablePath);
+
+        assertThat(retrieved).isInstanceOf(CatalogTable.class);
+        CatalogTable retrievedTable = (CatalogTable) retrieved;
+        assertThat(retrievedTable.getPartitionKeys())
+                .as("Partition keys declared in DDL must survive the Glue round-trip")
+                .containsExactly("region");
+        assertThat(retrievedTable.getComment()).isEqualTo("partitioned table comment");
+        assertThat(
+                        retrieved.getUnresolvedSchema().getColumns().stream()
+                                .map(org.apache.flink.table.api.Schema.UnresolvedColumn::getName)
+                                .collect(Collectors.toList()))
+                .as("Schema must contain both data and partition columns")
+                .containsExactly("id", "region");
+    }
+
+    /** Regression test for finding G1: full partition CRUD lifecycle. */
+    @Test
+    public void testPartitionCrudLifecycle() throws Exception {
+        ObjectPath tablePath = createPartitionedTable("ptndb2", "ptntable2");
+        CatalogPartitionSpec spec =
+                new CatalogPartitionSpec(Collections.singletonMap("region", "eu-west-1"));
+
+        // create
+        Map<String, String> partitionProps = new HashMap<>();
+        partitionProps.put("k", "v");
+        glueCatalog.createPartition(
+                tablePath, spec, new CatalogPartitionImpl(partitionProps, null), false);
+
+        // exists / get
+        assertThat(glueCatalog.partitionExists(tablePath, spec)).isTrue();
+        CatalogPartition retrieved = glueCatalog.getPartition(tablePath, spec);
+        assertThat(retrieved.getProperties()).containsEntry("k", "v");
+
+        // list (all + partial spec)
+        assertThat(glueCatalog.listPartitions(tablePath)).containsExactly(spec);
+        assertThat(glueCatalog.listPartitions(tablePath, spec)).containsExactly(spec);
+
+        // duplicate create: honored ifNotExists flag, otherwise PartitionAlreadyExistsException
+        glueCatalog.createPartition(
+                tablePath, spec, new CatalogPartitionImpl(new HashMap<>(), null), true);
+        assertThatThrownBy(
+                        () ->
+                                glueCatalog.createPartition(
+                                        tablePath,
+                                        spec,
+                                        new CatalogPartitionImpl(new HashMap<>(), null),
+                                        false))
+                .isInstanceOf(PartitionAlreadyExistsException.class);
+
+        // alter
+        Map<String, String> newProps = new HashMap<>();
+        newProps.put("k", "v2");
+        glueCatalog.alterPartition(
+                tablePath, spec, new CatalogPartitionImpl(newProps, null), false);
+        assertThat(glueCatalog.getPartition(tablePath, spec).getProperties())
+                .containsEntry("k", "v2");
+
+        // drop
+        glueCatalog.dropPartition(tablePath, spec, false);
+        assertThat(glueCatalog.partitionExists(tablePath, spec)).isFalse();
+        assertThatThrownBy(() -> glueCatalog.dropPartition(tablePath, spec, false))
+                .isInstanceOf(PartitionNotExistException.class);
+        // ignoreIfNotExists suppresses the error
+        glueCatalog.dropPartition(tablePath, spec, true);
+    }
+
+    /** Partition operations on a non-partitioned table must throw TableNotPartitionedException. */
+    @Test
+    public void testPartitionOpsOnNonPartitionedTable() throws Exception {
+        String databaseName = "ptndb3";
+        String tableName = "flattable";
+        glueCatalog.createDatabase(
+                databaseName, new CatalogDatabaseImpl(Collections.emptyMap(), "db"), true);
+        CatalogTable catalogTable =
+                CatalogTable.newBuilder()
+                        .schema(Schema.newBuilder().build())
+                        .comment("not partitioned")
+                        .partitionKeys(Collections.emptyList())
+                        .options(Collections.emptyMap())
+                        .build();
+        ObjectPath tablePath = new ObjectPath(databaseName, tableName);
+        glueCatalog.createTable(
+                tablePath, new ResolvedCatalogTable(catalogTable, ResolvedSchema.of()), false);
+
+        assertThatThrownBy(() -> glueCatalog.listPartitions(tablePath))
+                .isInstanceOf(TableNotPartitionedException.class);
+    }
+
+    /** An incomplete partition spec must be rejected per the Flink Catalog contract. */
+    @Test
+    public void testCreatePartitionWithInvalidSpec() throws Exception {
+        ObjectPath tablePath = createPartitionedTable("ptndb4", "ptntable4");
+        CatalogPartitionSpec emptySpec = new CatalogPartitionSpec(Collections.emptyMap());
+
+        assertThatThrownBy(
+                        () ->
+                                glueCatalog.createPartition(
+                                        tablePath,
+                                        emptySpec,
+                                        new CatalogPartitionImpl(new HashMap<>(), null),
+                                        false))
+                .isInstanceOf(PartitionSpecInvalidException.class);
     }
 }

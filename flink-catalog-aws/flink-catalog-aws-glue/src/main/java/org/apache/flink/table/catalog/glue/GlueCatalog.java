@@ -25,6 +25,7 @@ import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.CatalogPartition;
+import org.apache.flink.table.catalog.CatalogPartitionImpl;
 import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.CatalogView;
@@ -45,6 +46,7 @@ import org.apache.flink.table.catalog.exceptions.TableNotPartitionedException;
 import org.apache.flink.table.catalog.exceptions.TablePartitionedException;
 import org.apache.flink.table.catalog.glue.operator.GlueDatabaseOperator;
 import org.apache.flink.table.catalog.glue.operator.GlueFunctionOperator;
+import org.apache.flink.table.catalog.glue.operator.GluePartitionOperator;
 import org.apache.flink.table.catalog.glue.operator.GlueTableOperator;
 import org.apache.flink.table.catalog.glue.util.GlueCatalogConstants;
 import org.apache.flink.table.catalog.glue.util.GlueTableUtils;
@@ -60,14 +62,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.Partition;
+import software.amazon.awssdk.services.glue.model.PartitionInput;
 import software.amazon.awssdk.services.glue.model.StorageDescriptor;
 import software.amazon.awssdk.services.glue.model.Table;
 import software.amazon.awssdk.services.glue.model.TableInput;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -94,6 +102,7 @@ public class GlueCatalog extends AbstractCatalog {
     private GlueDatabaseOperator glueDatabaseOperations;
     private GlueTableOperator glueTableOperations;
     private GlueFunctionOperator glueFunctionsOperations;
+    private GluePartitionOperator gluePartitionOperations;
     private GlueTableUtils glueTableUtils;
 
     /**
@@ -160,6 +169,7 @@ public class GlueCatalog extends AbstractCatalog {
         this.glueDatabaseOperations = new GlueDatabaseOperator(glueClient, getName());
         this.glueTableOperations = new GlueTableOperator(glueClient, getName());
         this.glueFunctionsOperations = new GlueFunctionOperator(glueClient, getName());
+        this.gluePartitionOperations = new GluePartitionOperator(glueClient, getName());
     }
 
     /**
@@ -732,8 +742,12 @@ public class GlueCatalog extends AbstractCatalog {
     @Override
     public List<CatalogPartitionSpec> listPartitions(ObjectPath objectPath)
             throws TableNotExistException, TableNotPartitionedException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+        List<String> partitionKeys = tableRef.partitionKeys();
+        return gluePartitionOperations.listPartitions(tableRef.databaseName, tableRef.tableName)
+                .stream()
+                .map(partition -> toPartitionSpec(partitionKeys, partition.values()))
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -741,31 +755,70 @@ public class GlueCatalog extends AbstractCatalog {
             ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec)
             throws TableNotExistException, TableNotPartitionedException,
                     PartitionSpecInvalidException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+        List<String> partitionKeys = tableRef.partitionKeys();
+
+        Map<String, String> partialSpec =
+                catalogPartitionSpec == null
+                        ? Collections.emptyMap()
+                        : catalogPartitionSpec.getPartitionSpec();
+        // Flink's Catalog contract: a partial spec referencing unknown partition keys is invalid.
+        if (!partitionKeys.containsAll(partialSpec.keySet())) {
+            throw new PartitionSpecInvalidException(
+                    getName(), partitionKeys, objectPath, catalogPartitionSpec);
+        }
+
+        return gluePartitionOperations.listPartitions(tableRef.databaseName, tableRef.tableName)
+                .stream()
+                .map(partition -> toPartitionSpec(partitionKeys, partition.values()))
+                .filter(
+                        spec ->
+                                spec.getPartitionSpec()
+                                        .entrySet()
+                                        .containsAll(partialSpec.entrySet()))
+                .collect(Collectors.toList());
     }
 
     @Override
     public List<CatalogPartitionSpec> listPartitionsByFilter(
             ObjectPath objectPath, List<Expression> list)
             throws TableNotExistException, TableNotPartitionedException, CatalogException {
+        // Expression push-down to Glue partition filters is not implemented. Flink's planner
+        // catches UnsupportedOperationException and falls back to listPartitions().
         throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+                "Listing partitions by filter expression is not supported by the Glue Catalog.");
     }
 
     @Override
     public CatalogPartition getPartition(
             ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec)
             throws PartitionNotExistException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        Partition partition = getGluePartitionOrNull(objectPath, catalogPartitionSpec);
+        if (partition == null) {
+            throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+        }
+
+        Map<String, String> properties = new HashMap<>();
+        if (partition.parameters() != null) {
+            properties.putAll(partition.parameters());
+        }
+        if (partition.storageDescriptor() != null
+                && partition.storageDescriptor().location() != null) {
+            properties.put(
+                    GlueCatalogConstants.PARTITION_LOCATION,
+                    partition.storageDescriptor().location());
+        }
+        return new CatalogPartitionImpl(properties, null);
     }
 
     @Override
     public boolean partitionExists(ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec)
             throws CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        try {
+            return getGluePartitionOrNull(objectPath, catalogPartitionSpec) != null;
+        } catch (PartitionNotExistException e) {
+            return false;
+        }
     }
 
     @Override
@@ -773,20 +826,79 @@ public class GlueCatalog extends AbstractCatalog {
             ObjectPath objectPath,
             CatalogPartitionSpec catalogPartitionSpec,
             CatalogPartition catalogPartition,
-            boolean b)
+            boolean ifNotExists)
             throws TableNotExistException, TableNotPartitionedException,
                     PartitionSpecInvalidException, PartitionAlreadyExistsException,
                     CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+        List<String> partitionKeys = tableRef.partitionKeys();
+
+        Map<String, String> spec = catalogPartitionSpec.getPartitionSpec();
+        if (!spec.keySet().equals(new HashSet<>(partitionKeys))) {
+            throw new PartitionSpecInvalidException(
+                    getName(), partitionKeys, objectPath, catalogPartitionSpec);
+        }
+        List<String> partitionValues =
+                partitionKeys.stream().map(spec::get).collect(Collectors.toList());
+
+        Map<String, String> partitionProperties =
+                catalogPartition == null
+                        ? new HashMap<>()
+                        : new HashMap<>(catalogPartition.getProperties());
+        String location = partitionProperties.remove(GlueCatalogConstants.PARTITION_LOCATION);
+        StorageDescriptor.Builder sdBuilder =
+                tableRef.glueTable.storageDescriptor() != null
+                        ? tableRef.glueTable.storageDescriptor().toBuilder()
+                        : StorageDescriptor.builder();
+        if (location != null) {
+            sdBuilder.location(location);
+        } else if (tableRef.glueTable.storageDescriptor() != null
+                && tableRef.glueTable.storageDescriptor().location() != null) {
+            sdBuilder.location(
+                    buildDefaultPartitionLocation(
+                            tableRef.glueTable.storageDescriptor().location(),
+                            partitionKeys,
+                            partitionValues));
+        }
+
+        PartitionInput partitionInput =
+                PartitionInput.builder()
+                        .values(partitionValues)
+                        .storageDescriptor(sdBuilder.build())
+                        .parameters(partitionProperties)
+                        .build();
+
+        try {
+            gluePartitionOperations.createPartition(
+                    tableRef.databaseName, tableRef.tableName, partitionInput);
+        } catch (software.amazon.awssdk.services.glue.model.AlreadyExistsException e) {
+            if (!ifNotExists) {
+                throw new PartitionAlreadyExistsException(
+                        getName(), objectPath, catalogPartitionSpec);
+            }
+        }
     }
 
     @Override
     public void dropPartition(
-            ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec, boolean b)
+            ObjectPath objectPath,
+            CatalogPartitionSpec catalogPartitionSpec,
+            boolean ignoreIfNotExists)
             throws PartitionNotExistException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        try {
+            GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+            List<String> partitionValues =
+                    toOrderedPartitionValues(tableRef, objectPath, catalogPartitionSpec);
+            gluePartitionOperations.dropPartition(
+                    tableRef.databaseName, tableRef.tableName, partitionValues);
+        } catch (software.amazon.awssdk.services.glue.model.EntityNotFoundException
+                | PartitionNotExistException
+                | TableNotExistException
+                | TableNotPartitionedException e) {
+            if (!ignoreIfNotExists) {
+                throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+            }
+        }
     }
 
     @Override
@@ -794,10 +906,140 @@ public class GlueCatalog extends AbstractCatalog {
             ObjectPath objectPath,
             CatalogPartitionSpec catalogPartitionSpec,
             CatalogPartition catalogPartition,
-            boolean b)
+            boolean ignoreIfNotExists)
             throws PartitionNotExistException, CatalogException {
-        throw new UnsupportedOperationException(
-                "Table partitioning operations are not supported by the Glue Catalog.");
+        try {
+            GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+            List<String> partitionValues =
+                    toOrderedPartitionValues(tableRef, objectPath, catalogPartitionSpec);
+            Partition existing =
+                    gluePartitionOperations.getPartition(
+                            tableRef.databaseName, tableRef.tableName, partitionValues);
+            if (existing == null) {
+                throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+            }
+
+            Map<String, String> partitionProperties =
+                    catalogPartition == null
+                            ? new HashMap<>()
+                            : new HashMap<>(catalogPartition.getProperties());
+            String location = partitionProperties.remove(GlueCatalogConstants.PARTITION_LOCATION);
+            StorageDescriptor.Builder sdBuilder =
+                    existing.storageDescriptor() != null
+                            ? existing.storageDescriptor().toBuilder()
+                            : StorageDescriptor.builder();
+            if (location != null) {
+                sdBuilder.location(location);
+            }
+
+            PartitionInput partitionInput =
+                    PartitionInput.builder()
+                            .values(partitionValues)
+                            .storageDescriptor(sdBuilder.build())
+                            .parameters(partitionProperties)
+                            .build();
+
+            gluePartitionOperations.updatePartition(
+                    tableRef.databaseName, tableRef.tableName, partitionValues, partitionInput);
+        } catch (software.amazon.awssdk.services.glue.model.EntityNotFoundException
+                | TableNotExistException
+                | TableNotPartitionedException e) {
+            if (!ignoreIfNotExists) {
+                throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+            }
+        }
+    }
+
+    /** Resolved Glue storage names plus the fetched Glue table for partition operations. */
+    private static final class GlueTableRef {
+        private final String databaseName;
+        private final String tableName;
+        private final Table glueTable;
+
+        private GlueTableRef(String databaseName, String tableName, Table glueTable) {
+            this.databaseName = databaseName;
+            this.tableName = tableName;
+            this.glueTable = glueTable;
+        }
+
+        private List<String> partitionKeys() {
+            return glueTable.partitionKeys().stream()
+                    .map(software.amazon.awssdk.services.glue.model.Column::name)
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /**
+     * Resolves the Glue storage names for the given path (using the same case-insensitive
+     * resolution as {@link #getTable(ObjectPath)}) and validates that the table is partitioned.
+     */
+    private GlueTableRef resolvePartitionedTable(ObjectPath objectPath)
+            throws TableNotExistException, TableNotPartitionedException, CatalogException {
+        String glueDatabaseName = findGlueDatabaseName(objectPath.getDatabaseName());
+        if (glueDatabaseName == null) {
+            throw new TableNotExistException(getName(), objectPath);
+        }
+        String glueTableName = findGlueTableName(glueDatabaseName, objectPath.getObjectName());
+        if (glueTableName == null) {
+            throw new TableNotExistException(getName(), objectPath);
+        }
+        Table glueTable = glueTableOperations.getGlueTable(glueDatabaseName, glueTableName);
+        if (glueTable.partitionKeys() == null || glueTable.partitionKeys().isEmpty()) {
+            throw new TableNotPartitionedException(getName(), objectPath);
+        }
+        return new GlueTableRef(glueDatabaseName, glueTableName, glueTable);
+    }
+
+    /**
+     * Resolves a full partition spec into partition values ordered by the table's partition keys.
+     * An incomplete or mismatched spec identifies a partition that cannot exist, so {@link
+     * PartitionNotExistException} is thrown (matching the Flink Catalog contract for
+     * partition-addressing methods that do not declare PartitionSpecInvalidException).
+     */
+    private List<String> toOrderedPartitionValues(
+            GlueTableRef tableRef, ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec)
+            throws PartitionNotExistException {
+        List<String> partitionKeys = tableRef.partitionKeys();
+        Map<String, String> spec = catalogPartitionSpec.getPartitionSpec();
+        if (!spec.keySet().equals(new HashSet<>(partitionKeys))) {
+            throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+        }
+        return partitionKeys.stream().map(spec::get).collect(Collectors.toList());
+    }
+
+    private Partition getGluePartitionOrNull(
+            ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec)
+            throws PartitionNotExistException, CatalogException {
+        try {
+            GlueTableRef tableRef = resolvePartitionedTable(objectPath);
+            List<String> partitionValues =
+                    toOrderedPartitionValues(tableRef, objectPath, catalogPartitionSpec);
+            return gluePartitionOperations.getPartition(
+                    tableRef.databaseName, tableRef.tableName, partitionValues);
+        } catch (TableNotExistException | TableNotPartitionedException e) {
+            throw new PartitionNotExistException(getName(), objectPath, catalogPartitionSpec);
+        }
+    }
+
+    private static CatalogPartitionSpec toPartitionSpec(
+            List<String> partitionKeys, List<String> values) {
+        Map<String, String> spec = new LinkedHashMap<>();
+        for (int i = 0; i < partitionKeys.size() && i < values.size(); i++) {
+            spec.put(partitionKeys.get(i), values.get(i));
+        }
+        return new CatalogPartitionSpec(spec);
+    }
+
+    private static String buildDefaultPartitionLocation(
+            String tableLocation, List<String> partitionKeys, List<String> partitionValues) {
+        StringBuilder location = new StringBuilder(tableLocation);
+        for (int i = 0; i < partitionKeys.size(); i++) {
+            location.append('/')
+                    .append(partitionKeys.get(i))
+                    .append('=')
+                    .append(partitionValues.get(i));
+        }
+        return location.toString();
     }
 
     /**
@@ -1226,20 +1468,44 @@ public class GlueCatalog extends AbstractCatalog {
         // Extract table location
         String tableLocation = glueTableUtils.extractTableLocation(tableProperties, objectPath);
 
-        // Resolve the schema and map Flink columns to Glue columns
+        // Resolve the schema and map Flink columns to Glue columns, splitting data columns
+        // (stored in the storage descriptor) from partition columns (stored on the
+        // TableInput itself) — Glue models partition keys outside the storage descriptor.
         ResolvedCatalogBaseTable<?> resolvedTable = (ResolvedCatalogBaseTable<?>) catalogTable;
-        List<software.amazon.awssdk.services.glue.model.Column> glueColumns =
-                resolvedTable.getResolvedSchema().getColumns().stream()
-                        .map(glueTableUtils::mapFlinkColumnToGlueColumn)
+        List<String> partitionKeys = catalogTable.getPartitionKeys();
+
+        List<software.amazon.awssdk.services.glue.model.Column> dataColumns = new ArrayList<>();
+        Map<String, software.amazon.awssdk.services.glue.model.Column> partitionColumnsByName =
+                new HashMap<>();
+        for (org.apache.flink.table.catalog.Column flinkColumn :
+                resolvedTable.getResolvedSchema().getColumns()) {
+            software.amazon.awssdk.services.glue.model.Column glueColumn =
+                    glueTableUtils.mapFlinkColumnToGlueColumn(flinkColumn);
+            if (partitionKeys.contains(flinkColumn.getName())) {
+                partitionColumnsByName.put(flinkColumn.getName(), glueColumn);
+            } else {
+                dataColumns.add(glueColumn);
+            }
+        }
+
+        // Preserve the declared partition-key order.
+        List<software.amazon.awssdk.services.glue.model.Column> partitionColumns =
+                partitionKeys.stream()
+                        .map(partitionColumnsByName::get)
+                        .filter(Objects::nonNull)
                         .collect(Collectors.toList());
 
         StorageDescriptor storageDescriptor =
-                glueTableUtils.buildStorageDescriptor(tableProperties, glueColumns, tableLocation);
+                glueTableUtils.buildStorageDescriptor(tableProperties, dataColumns, tableLocation);
 
         // Pass original table name to preserve case
         TableInput tableInput =
                 glueTableOperations.buildTableInput(
-                        tableName, glueColumns, catalogTable, storageDescriptor, tableProperties);
+                        tableName,
+                        partitionColumns,
+                        catalogTable,
+                        storageDescriptor,
+                        tableProperties);
 
         // Use proper database name resolution
         String glueDatabaseName = findGlueDatabaseName(databaseName);

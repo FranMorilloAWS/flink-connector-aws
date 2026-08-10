@@ -101,40 +101,52 @@ public class GlueTableUtils {
     public Column mapFlinkColumnToGlueColumn(org.apache.flink.table.catalog.Column flinkColumn) {
         String glueType = glueTypeConverter.toGlueDataType(flinkColumn.getDataType());
 
-        return Column.builder()
-                .name(flinkColumn.getName().toLowerCase())
-                .type(glueType)
-                .parameters(Collections.singletonMap("originalName", flinkColumn.getName()))
-                .build();
+        // Preserve the original column name: Glue supports mixed-case column names, and
+        // force-lowercasing breaks case-sensitive downstream engines.
+        return Column.builder().name(flinkColumn.getName()).type(glueType).build();
     }
 
     /**
      * Converts a Glue table into a Flink schema. Each Glue column is mapped to a Flink column using
-     * the GlueTypeConverter.
+     * the GlueTypeConverter. Partition columns (stored at the Glue table level, not in the storage
+     * descriptor) are appended after the data columns so that declared partition keys are part of
+     * the Flink schema, as required by {@code CatalogTable}.
      *
      * @param glueTable The Glue table from which the schema will be derived.
      * @return A Flink schema constructed from the Glue table's columns.
      */
     public Schema getSchemaFromGlueTable(Table glueTable) {
-        List<Column> columns = glueTable.storageDescriptor().columns();
         Schema.Builder schemaBuilder = Schema.newBuilder();
 
+        List<Column> columns =
+                glueTable.storageDescriptor() != null
+                        ? glueTable.storageDescriptor().columns()
+                        : Collections.emptyList();
         for (Column column : columns) {
-            String columnName = column.name();
-            String originalName = columnName;
-
-            if (column.parameters() != null && column.parameters().containsKey("originalName")) {
-                originalName = column.parameters().get("originalName");
-            }
-
-            String columnType = column.type();
-            // .toLowerCase();
-            DataType flinkDataType = glueTypeConverter.toFlinkDataType(columnType);
-
-            schemaBuilder.column(originalName, flinkDataType);
+            addGlueColumnToSchema(column, schemaBuilder);
         }
 
-        Schema schema = schemaBuilder.build();
-        return schema;
+        // Partition columns live in Table.partitionKeys(), not in the storage descriptor.
+        if (glueTable.partitionKeys() != null) {
+            for (Column partitionColumn : glueTable.partitionKeys()) {
+                addGlueColumnToSchema(partitionColumn, schemaBuilder);
+            }
+        }
+
+        return schemaBuilder.build();
+    }
+
+    private void addGlueColumnToSchema(Column column, Schema.Builder schemaBuilder) {
+        String columnName = column.name();
+
+        // Backwards compatibility: tables written by older versions of this catalog were
+        // stored with lowercased names and the original name stashed in an "originalName"
+        // column parameter. Honor it on read so existing tables keep their declared names.
+        if (column.parameters() != null && column.parameters().containsKey("originalName")) {
+            columnName = column.parameters().get("originalName");
+        }
+
+        DataType flinkDataType = glueTypeConverter.toFlinkDataType(column.type());
+        schemaBuilder.column(columnName, flinkDataType);
     }
 }

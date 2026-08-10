@@ -32,7 +32,7 @@ under the License.
     <packaging>pom</packaging>
 
     <properties>
-        <aws.version>2.20.56</aws.version>
+        <aws.version>2.40.3</aws.version>
         <jackson.version>2.14.2</jackson.version>
     </properties>
 

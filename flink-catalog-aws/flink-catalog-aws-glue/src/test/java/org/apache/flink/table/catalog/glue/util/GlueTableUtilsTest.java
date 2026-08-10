@@ -112,9 +112,9 @@ class GlueTableUtilsTest {
         // Assert that the Glue column is correctly mapped
         Assertions.assertNotNull(glueColumn, "Converted Glue column should not be null");
         Assertions.assertEquals(
-                TEST_COLUMN_NAME.toLowerCase(),
+                TEST_COLUMN_NAME,
                 glueColumn.name(),
-                "Column name should be lowercase");
+                "Column name should be preserved as declared (no lowercasing)");
         Assertions.assertEquals(
                 "string", glueColumn.type(), "Column type should match the expected Glue type");
     }
@@ -157,27 +157,25 @@ class GlueTableUtilsTest {
         Column glueMixedCase = glueTableUtils.mapFlinkColumnToGlueColumn(mixedCaseColumn);
         Column glueLowerCase = glueTableUtils.mapFlinkColumnToGlueColumn(lowerCaseColumn);
 
-        // 3. Verify that Glue column names are lowercase
-        Assertions.assertEquals(
-                "uppercasecolumn", glueUpperCase.name(), "Glue column name should be lowercase");
-        Assertions.assertEquals(
-                "mixedcasecolumn", glueMixedCase.name(), "Glue column name should be lowercase");
-        Assertions.assertEquals(
-                "lowercase_column", glueLowerCase.name(), "Glue column name should be lowercase");
-
-        // 4. Verify that originalName parameter preserves case
+        // 3. Verify that Glue column names preserve the declared case
         Assertions.assertEquals(
                 "UpperCaseColumn",
-                glueUpperCase.parameters().get("originalName"),
-                "originalName parameter should preserve original case");
+                glueUpperCase.name(),
+                "Glue column name should preserve original case");
         Assertions.assertEquals(
                 "mixedCaseColumn",
-                glueMixedCase.parameters().get("originalName"),
-                "originalName parameter should preserve original case");
+                glueMixedCase.name(),
+                "Glue column name should preserve original case");
         Assertions.assertEquals(
                 "lowercase_column",
-                glueLowerCase.parameters().get("originalName"),
-                "originalName parameter should preserve original case");
+                glueLowerCase.name(),
+                "Glue column name should preserve original case");
+
+        // 4. Verify no originalName side-channel parameter is written anymore
+        Assertions.assertFalse(
+                glueUpperCase.parameters() != null
+                        && glueUpperCase.parameters().containsKey("originalName"),
+                "originalName side-channel parameter should no longer be written");
 
         // 5. Create a Glue table with these columns
         List<Column> glueColumns = Arrays.asList(glueUpperCase, glueMixedCase, glueLowerCase);
@@ -225,19 +223,15 @@ class GlueTableUtilsTest {
                         .map(glueTableUtils::mapFlinkColumnToGlueColumn)
                         .collect(Collectors.toList());
 
-        // 3. Verify Glue columns are lowercase but have original names in parameters
+        // 3. Verify Glue columns preserve the declared case directly (no side-channel)
         for (int i = 0; i < flinkColumns.size(); i++) {
             String originalName = flinkColumns.get(i).getName();
             String glueName = glueColumns.get(i).name();
 
             Assertions.assertEquals(
-                    originalName.toLowerCase(),
-                    glueName,
-                    "Glue column name should be lowercase of original");
-            Assertions.assertEquals(
                     originalName,
-                    glueColumns.get(i).parameters().get("originalName"),
-                    "Original name should be preserved in column parameters");
+                    glueName,
+                    "Glue column name should preserve the original case directly");
         }
 
         // 4. Create a Glue table with these columns (simulating storage in Glue)
@@ -283,5 +277,52 @@ class GlueTableUtilsTest {
                 "DATA_VALUE",
                 resultColumnNames.get(3),
                 "Fourth column should maintain original case");
+    }
+
+    @Test
+    void testGetSchemaFromGlueTableHonorsLegacyOriginalNameParameter() {
+        // Tables written by older catalog versions carry lowercased names plus an
+        // "originalName" column parameter; reads must still surface the declared name.
+        Column legacyColumn =
+                Column.builder()
+                        .name("username")
+                        .type("string")
+                        .parameters(java.util.Collections.singletonMap("originalName", "UserName"))
+                        .build();
+        StorageDescriptor storageDescriptor =
+                StorageDescriptor.builder().columns(Arrays.asList(legacyColumn)).build();
+        Table glueTable = Table.builder().storageDescriptor(storageDescriptor).build();
+
+        Schema schema = glueTableUtils.getSchemaFromGlueTable(glueTable);
+
+        Assertions.assertEquals(1, schema.getColumns().size(), "Schema should have one column");
+        Assertions.assertEquals(
+                "UserName",
+                schema.getColumns().get(0).getName(),
+                "Legacy originalName parameter should still be honored on read");
+    }
+
+    @Test
+    void testGetSchemaFromGlueTableIncludesPartitionColumns() {
+        // Partition columns live in Table.partitionKeys(), not in the storage descriptor;
+        // the derived Flink schema must include them for CatalogTable partition keys to resolve.
+        Column dataColumn = Column.builder().name("id").type("int").build();
+        Column partitionColumn = Column.builder().name("region").type("string").build();
+        StorageDescriptor storageDescriptor =
+                StorageDescriptor.builder().columns(Arrays.asList(dataColumn)).build();
+        Table glueTable =
+                Table.builder()
+                        .storageDescriptor(storageDescriptor)
+                        .partitionKeys(Arrays.asList(partitionColumn))
+                        .build();
+
+        Schema schema = glueTableUtils.getSchemaFromGlueTable(glueTable);
+
+        List<String> columnNames =
+                schema.getColumns().stream().map(col -> col.getName()).collect(Collectors.toList());
+        Assertions.assertEquals(
+                Arrays.asList("id", "region"),
+                columnNames,
+                "Schema should contain data columns followed by partition columns");
     }
 }

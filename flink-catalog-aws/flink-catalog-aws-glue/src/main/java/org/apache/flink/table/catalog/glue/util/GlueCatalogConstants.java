@@ -44,6 +44,10 @@ public class GlueCatalogConstants {
     // These follow the pattern established for column names
     public static final String ORIGINAL_DATABASE_NAME = "flink.original-database-name";
     public static final String ORIGINAL_TABLE_NAME = "flink.original-table-name";
+
+    /** Partition property key carrying the partition's storage location. */
+    public static final String PARTITION_LOCATION = "location";
+
     public static final String ORIGINAL_COLUMN_NAME =
             "originalName"; // Keep existing for backward compatibility
     public static final String ORIGINAL_FUNCTION_NAME = "flink.original-function-name";
