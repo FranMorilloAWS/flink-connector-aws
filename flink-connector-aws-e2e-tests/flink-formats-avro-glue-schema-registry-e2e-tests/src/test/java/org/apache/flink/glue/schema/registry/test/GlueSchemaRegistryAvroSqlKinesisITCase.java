@@ -330,7 +330,7 @@ class GlueSchemaRegistryAvroSqlKinesisITCase {
     }
 
     @Test
-    void compatibilityBackwardRejectsRequiredFieldRemoval() throws Exception {
+    void compatibilityBackwardRejectsNewRequiredField() throws Exception {
         String streamArn = createStream("gsr_avro_sql_compat_bw");
         String schemaName = schemaName("compat-backward");
 
@@ -355,18 +355,24 @@ class GlueSchemaRegistryAvroSqlKinesisITCase {
                         "INSERT INTO compat_bw_v2 VALUES ('Bob', 25, 'Portland', 'bob@example.com')")
                 .await(120, TimeUnit.SECONDS);
 
-        // v3: remove a required field -> BACKWARD violation, must be rejected.
+        // v3: ADD a required (NOT NULL, no default) field -> BACKWARD violation,
+        // must be rejected. (Removing a field is backward-compatible in Avro:
+        // a new reader simply ignores the extra field in old data. The true
+        // violation is a new required reader field that old data cannot supply.)
         createKinesisTable(
                 "compat_bw_v3",
-                "user_name STRING NOT NULL, age INT NOT NULL",
+                "user_name STRING NOT NULL, age INT NOT NULL, city STRING NOT NULL,"
+                        + " country STRING NOT NULL",
                 streamArn,
                 false,
                 compatOpts(schemaName, "BACKWARD"));
         assertThatThrownBy(
                         () ->
-                                tEnv.executeSql("INSERT INTO compat_bw_v3 VALUES ('Charlie', 35)")
+                                tEnv.executeSql(
+                                                "INSERT INTO compat_bw_v3 VALUES"
+                                                        + " ('Charlie', 35, 'Boston', 'USA')")
                                         .await(120, TimeUnit.SECONDS))
-                .as("removing a required field must violate BACKWARD compatibility")
+                .as("adding a required field without default must violate BACKWARD compatibility")
                 .isInstanceOf(Exception.class);
     }
 

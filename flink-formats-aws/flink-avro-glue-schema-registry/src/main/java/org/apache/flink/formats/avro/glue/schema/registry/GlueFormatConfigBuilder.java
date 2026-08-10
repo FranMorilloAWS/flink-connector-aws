@@ -76,7 +76,8 @@ public class GlueFormatConfigBuilder {
                         v -> properties.put(AWSSchemaRegistryConstants.COMPATIBILITY_SETTING, v));
         formatOptions
                 .getOptional(GlueFormatOptions.SCHEMA_COMPRESSION)
-                .ifPresent(v -> properties.put(AWSSchemaRegistryConstants.COMPRESSION_TYPE, v));
+                .ifPresent(
+                        v -> properties.put(AWSSchemaRegistryConstants.COMPRESSION_TYPE, v.name()));
 
         return properties;
     }

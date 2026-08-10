@@ -86,8 +86,12 @@ class GlueFormatConfigBuilderPropertyTest {
                 AWSSchemaRegistryConstants.SCHEMA_AUTO_REGISTRATION_SETTING);
         assertOptionalMapping(
                 result, input.compatibility, AWSSchemaRegistryConstants.COMPATIBILITY_SETTING);
+        // Compression must land as the enum NAME string: the GSR serde casts this
+        // config value to String at serializer init.
         assertOptionalMapping(
-                result, input.compression, AWSSchemaRegistryConstants.COMPRESSION_TYPE);
+                result,
+                input.compression.map(Enum::name),
+                AWSSchemaRegistryConstants.COMPRESSION_TYPE);
 
         // Verify map size equals number of provided options
         long providedCount =
