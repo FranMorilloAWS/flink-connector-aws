@@ -52,6 +52,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 /**
@@ -278,6 +279,86 @@ class GlueSchemaRegistryJsonSqlKinesisITCase {
     // Helpers
     // ------------------------------------------------------------------------
 
+    /**
+     * (e) A schema registered by a prior writer can be reused by a second writer that does
+     * <b>not</b> auto-register. Phase A writes two rows through a table with {@code
+     * 'json-glue.schema.autoRegistration' = 'true'}, registering the derived JSON Schema in real
+     * GSR. Phase B writes two more rows through a second table that targets the <b>same</b> schema
+     * name with {@code 'json-glue.schema.autoRegistration' = 'false'} — this must succeed against
+     * the now-existing schema. All four rows are then read back and asserted.
+     */
+    @Test
+    void existingSchemaWithoutAutoRegistration() throws Exception {
+        String streamName = uniqueName("json_sql_existing");
+        String streamArn = createStream(streamName);
+        String schemaName = registerSchemaName("existing");
+
+        String columns = "user_name STRING, favorite_number INT, favorite_color STRING";
+
+        // Phase A: register the JSON Schema in real GSR via autoRegistration=true.
+        StreamTableEnvironment tEnvA = newTableEnv();
+        tEnvA.executeSql(sinkDdl("existing_sink_auto", columns, streamArn, schemaName, null));
+        tEnvA.executeSql(
+                        "INSERT INTO existing_sink_auto VALUES "
+                                + "('Alice', 1, 'blue'),"
+                                + "('Bob', 2, 'green')")
+                .await(2, TimeUnit.MINUTES);
+
+        // Phase B: reuse the now-existing schema with autoRegistration=false — must succeed.
+        StreamTableEnvironment tEnvB = newTableEnv();
+        tEnvB.executeSql(
+                sinkDdlNoAutoRegister("existing_sink_noauto", columns, streamArn, schemaName));
+        tEnvB.executeSql(
+                        "INSERT INTO existing_sink_noauto VALUES "
+                                + "('Charlie', 3, 'red'),"
+                                + "('Dave', 4, 'yellow')")
+                .await(2, TimeUnit.MINUTES);
+
+        // All four rows written under the same schema must round-trip.
+        StreamTableEnvironment tEnvR = newTableEnv();
+        tEnvR.executeSql(sourceDdl("existing_source", columns, streamArn, schemaName, null));
+        List<Row> rows =
+                collect(tEnvR, "SELECT * FROM existing_source", 4, Duration.ofSeconds(120));
+
+        assertThat(rows).hasSize(4);
+        assertThat(rows)
+                .extracting(row -> row.getField(0))
+                .containsExactlyInAnyOrder("Alice", "Bob", "Charlie", "Dave");
+    }
+
+    /**
+     * (f) Writing with {@code 'json-glue.schema.autoRegistration' = 'false'} against a schema name
+     * that was never registered in GSR must fail — the writer cannot resolve a schema and is not
+     * permitted to create one.
+     */
+    @Test
+    void missingSchemaWithoutAutoRegistrationFails() throws Exception {
+        String streamName = uniqueName("json_sql_missing");
+        String streamArn = createStream(streamName);
+        // Unique name that is never registered in GSR (still tracked for best-effort cleanup).
+        String schemaName = registerSchemaName("missing");
+
+        String columns = "user_name STRING, favorite_number INT, favorite_color STRING";
+
+        StreamTableEnvironment tEnv = newTableEnv();
+        tEnv.executeSql(sinkDdlNoAutoRegister("missing_sink", columns, streamArn, schemaName));
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                "INSERT INTO missing_sink VALUES "
+                                                        + "('Alice', 1, 'blue')")
+                                        .await(2, TimeUnit.MINUTES))
+                .as(
+                        "writing with autoRegistration=false against a schema that was never "
+                                + "registered in GSR must fail")
+                .isInstanceOf(Exception.class);
+    }
+
+    // ------------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------------
+
     private static StreamTableEnvironment newTableEnv() {
         StreamExecutionEnvironment execEnv = StreamExecutionEnvironment.getExecutionEnvironment();
         execEnv.setParallelism(1);
@@ -293,6 +374,28 @@ class GlueSchemaRegistryJsonSqlKinesisITCase {
                 + ") WITH ("
                 + kinesisConnectorOptions(streamArn, false)
                 + gsrFormatOptions(schemaName, true, compression)
+                + ")";
+    }
+
+    private String sinkDdlNoAutoRegister(
+            String table, String columns, String streamArn, String schemaName) {
+        return "CREATE TABLE "
+                + table
+                + " ("
+                + columns
+                + ") WITH ("
+                + kinesisConnectorOptions(streamArn, false)
+                + "  'format' = 'json-glue',"
+                + "  'json-glue.aws.region' = '"
+                + GSR_REGION
+                + "',"
+                + "  'json-glue.registry.name' = '"
+                + REGISTRY_NAME
+                + "',"
+                + "  'json-glue.schema.name' = '"
+                + schemaName
+                + "',"
+                + "  'json-glue.schema.autoRegistration' = 'false'"
                 + ")";
     }
 
