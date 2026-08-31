@@ -102,6 +102,10 @@ public class SplitTracker {
         addSplitsForLatest(shardsToAdd);
     }
 
+    public void addChildSplits(Collection<Shard> childShardsToAdd) {
+        addSplitsForTrimHorizon(childShardsToAdd);
+    }
+
     private void addSplitsForLatest(Collection<Shard> shardsToAdd) {
         List<Shard> openShards =
                 shardsToAdd.stream()
@@ -221,8 +225,7 @@ public class SplitTracker {
      * iterate all the values in knownSplits so saving compute
      */
     public List<DynamoDbStreamsShardSplit> getUnassignedChildSplits(Set<String> parentSplitIds) {
-        return parentSplitIds
-                .parallelStream()
+        return parentSplitIds.parallelStream()
                 .filter(
                         splitId -> {
                             if (!parentChildSplitMap.containsKey(splitId)) {
@@ -263,17 +266,13 @@ public class SplitTracker {
      * not there, that means that that should already be cleaned up.
      */
     public List<DynamoDbStreamsShardSplit> splitsAvailableForAssignment() {
-        return knownSplits
-                .values()
-                .parallelStream()
+        return knownSplits.values().parallelStream()
                 .filter(this::checkIfSplitCanBeAssigned)
                 .collect(Collectors.toList());
     }
 
     public List<DynamoDBStreamsShardSplitWithAssignmentStatus> snapshotState(long checkpointId) {
-        return knownSplits
-                .values()
-                .parallelStream()
+        return knownSplits.values().parallelStream()
                 .map(
                         split -> {
                             SplitAssignmentStatus assignmentStatus =
@@ -333,7 +332,13 @@ public class SplitTracker {
                 || isFinished(split.getParentShardId());
     }
 
-    private boolean isFinished(String splitId) {
+    /**
+     * Provides information whether a split is finished or not.
+     *
+     * @param splitId
+     * @return boolean value indicating if split is finished
+     */
+    public boolean isFinished(String splitId) {
         return finishedSplits.contains(splitId);
     }
 }

@@ -45,13 +45,6 @@ public class DynamodbStreamsSourceConfigConstants {
                     .defaultValue(Duration.ofSeconds(60))
                     .withDescription("The interval between each attempt to discover new shards.");
 
-    public static final ConfigOption<Integer> DESCRIBE_STREAM_INCONSISTENCY_RESOLUTION_RETRY_COUNT =
-            ConfigOptions.key("flink.describestream.inconsistencyresolution.retries")
-                    .intType()
-                    .defaultValue(5)
-                    .withDescription(
-                            "The number of times to retry build shard lineage if describestream returns inconsistent response");
-
     public static final ConfigOption<Integer> DYNAMODB_STREAMS_RETRY_COUNT =
             ConfigOptions.key("flink.dynamodbstreams.numretries")
                     .intType()
@@ -75,6 +68,25 @@ public class DynamodbStreamsSourceConfigConstants {
 
     public static final String BASE_DDB_STREAMS_USER_AGENT_PREFIX_FORMAT =
             "Apache Flink %s (%s) DynamoDb Streams Connector";
+
+    public static final ConfigOption<Duration>
+            DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS =
+                    ConfigOptions.key("flink.dynamodbstreams.getrecords.empty.mindelay")
+                            .durationType()
+                            .defaultValue(Duration.ofMillis(1000))
+                            .withDescription(
+                                    "The idle time between empty polls for DynamoDB Streams GetRecords API");
+    public static final ConfigOption<Duration>
+            DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_NON_EMPTY_POLLS =
+                    ConfigOptions.key("flink.dynamodbstreams.getrecords.nonempty.mindelay")
+                            .durationType()
+                            .defaultValue(Duration.ofMillis(250))
+                            .withDescription(
+                                    "The default idle time between non-empty polls for DynamoDB Streams GetRecords API");
+
+    public static final int MAX_RETRY_ATTEMPTS_FOR_CHILD_SHARDS = 5;
+    public static final long CHILD_SHARD_DISCOVERY_MIN_DELAY_MS = 100;
+    public static final long CHILD_SHARD_DISCOVERY_MAX_DELAY_MS = 1000;
 
     /** DynamoDb Streams identifier for user agent prefix. */
     public static final String DDB_STREAMS_CLIENT_USER_AGENT_PREFIX =

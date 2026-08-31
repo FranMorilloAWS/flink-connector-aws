@@ -34,12 +34,16 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static java.util.Collections.singletonMap;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 /** Test for {@link RowDataToAttributeValueConverter}. */
 public class RowDataToAttributeValueConverterTest {
@@ -69,7 +73,7 @@ public class RowDataToAttributeValueConverterTest {
         RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
                 new RowDataToAttributeValueConverter(dataType, true);
         Map<String, AttributeValue> actualResult =
-                rowDataToAttributeValueConverter.convertRowData(createElement(null));
+                rowDataToAttributeValueConverter.convertRowData(createElement((Object) null));
 
         assertThat(actualResult.isEmpty()).isEqualTo(true);
     }
@@ -216,7 +220,7 @@ public class RowDataToAttributeValueConverterTest {
         Map<String, AttributeValue> actualResult =
                 rowDataToAttributeValueConverter.convertRowData(createElement(value));
         Map<String, AttributeValue> expectedResult =
-                singletonMap(key, AttributeValue.builder().n("1.23456791E17").build());
+                singletonMap(key, AttributeValue.builder().n(String.valueOf(value)).build());
 
         assertThat(actualResult).containsAllEntriesOf(expectedResult);
     }
@@ -250,6 +254,93 @@ public class RowDataToAttributeValueConverterTest {
                         createElement(TimestampData.fromLocalDateTime(value)));
         Map<String, AttributeValue> expectedResult =
                 singletonMap(key, AttributeValue.builder().s("2022-11-10T00:00").build());
+
+        assertThat(actualResult).containsAllEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testRowDataType() {
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(
+                                "innerRow",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD("f1", DataTypes.STRING()),
+                                        DataTypes.FIELD("f2", DataTypes.INT()))));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType);
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(
+                        createElement(createElement(StringData.fromString("some string"), 123)));
+
+        Map<String, AttributeValue> innerMap =
+                Map.of(
+                        "f1", AttributeValue.builder().s("some string").build(),
+                        "f2", AttributeValue.builder().n("123").build());
+        Map<String, AttributeValue> expectedResult =
+                singletonMap("innerRow", AttributeValue.builder().m(innerMap).build());
+
+        assertThat(actualResult).containsAllEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testRowDataTypeNullInnerField() {
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(
+                                "innerRow",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD("f1", DataTypes.STRING()),
+                                        DataTypes.FIELD("f2", DataTypes.INT()))));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType);
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(
+                        createElement(createElement(StringData.fromString("value"), null)));
+
+        Map<String, AttributeValue> innerMap =
+                Map.of(
+                        "f1", AttributeValue.builder().s("value").build(),
+                        "f2", AttributeValue.builder().nul(true).build());
+        Map<String, AttributeValue> expectedResult =
+                singletonMap("innerRow", AttributeValue.builder().m(innerMap).build());
+
+        assertThat(actualResult).containsAllEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testNestedRowDataType() {
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(
+                                "outer",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD(
+                                                "middle",
+                                                DataTypes.ROW(
+                                                        DataTypes.FIELD(
+                                                                "leaf", DataTypes.STRING()))),
+                                        DataTypes.FIELD("sibling", DataTypes.INT()))));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType);
+
+        GenericRowData leafRow = new GenericRowData(1);
+        leafRow.setField(0, StringData.fromString("deep"));
+        GenericRowData outerRow = new GenericRowData(2);
+        outerRow.setField(0, leafRow);
+        outerRow.setField(1, 42);
+
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(createElement(outerRow));
+
+        Map<String, AttributeValue> leafMap =
+                Map.of("leaf", AttributeValue.builder().s("deep").build());
+        Map<String, AttributeValue> outerMap =
+                Map.of(
+                        "middle", AttributeValue.builder().m(leafMap).build(),
+                        "sibling", AttributeValue.builder().n("42").build());
+        Map<String, AttributeValue> expectedResult =
+                singletonMap("outer", AttributeValue.builder().m(outerMap).build());
 
         assertThat(actualResult).containsAllEntriesOf(expectedResult);
     }
@@ -560,9 +651,180 @@ public class RowDataToAttributeValueConverterTest {
         assertThat(actualResult).containsAllEntriesOf(expectedResult);
     }
 
-    private RowData createElement(Object value) {
-        GenericRowData element = new GenericRowData(1);
-        element.setField(0, value);
+    @Test
+    void testRowDataTypeArray() {
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(
+                                "rows",
+                                DataTypes.ARRAY(
+                                        DataTypes.ROW(
+                                                DataTypes.FIELD("name", DataTypes.STRING()),
+                                                DataTypes.FIELD("value", DataTypes.INT())))));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType);
+
+        GenericRowData row1 = new GenericRowData(2);
+        row1.setField(0, StringData.fromString("first"));
+        row1.setField(1, 1);
+        GenericRowData row2 = new GenericRowData(2);
+        row2.setField(0, StringData.fromString("second"));
+        row2.setField(1, 2);
+
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(
+                        createElement(new GenericArrayData(new RowData[] {row1, row2})));
+
+        Map<String, AttributeValue> row1Map =
+                Map.of(
+                        "name", AttributeValue.builder().s("first").build(),
+                        "value", AttributeValue.builder().n("1").build());
+        Map<String, AttributeValue> row2Map =
+                Map.of(
+                        "name", AttributeValue.builder().s("second").build(),
+                        "value", AttributeValue.builder().n("2").build());
+        Map<String, AttributeValue> expectedResult =
+                singletonMap(
+                        "rows",
+                        AttributeValue.builder()
+                                .l(
+                                        AttributeValue.builder().m(row1Map).build(),
+                                        AttributeValue.builder().m(row2Map).build())
+                                .build());
+
+        assertThat(actualResult).containsAllEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testDeleteOnlyPrimaryKey() {
+        String key = "key";
+        String value = "some_value";
+        String otherField = "other_field";
+        String otherValue = "other_value";
+
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(key, DataTypes.STRING()),
+                        DataTypes.FIELD(otherField, DataTypes.STRING()));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType, List.of(key));
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowDataToKey(
+                        createElement(
+                                StringData.fromString(value), StringData.fromString(otherValue)));
+        Map<String, AttributeValue> expectedResult =
+                singletonMap(key, AttributeValue.builder().s(value).build());
+
+        assertThat(actualResult).containsExactlyInAnyOrderEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testDeleteOnlyPrimaryKeys() {
+        String key = "key";
+        String value = "some_value";
+        String additionalKey = "additional_key";
+        String additionalValue = "additional_value";
+        String otherField = "other_field";
+        String otherValue = "other_value";
+
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(key, DataTypes.STRING()),
+                        DataTypes.FIELD(additionalKey, DataTypes.STRING()),
+                        DataTypes.FIELD(otherField, DataTypes.STRING()));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType, List.of(key, additionalKey));
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowDataToKey(
+                        createElement(
+                                StringData.fromString(value),
+                                StringData.fromString(additionalValue),
+                                StringData.fromString(otherValue)));
+        Map<String, AttributeValue> expectedResult = new HashMap<>();
+        expectedResult.put(key, AttributeValue.builder().s(value).build());
+        expectedResult.put(additionalKey, AttributeValue.builder().s(additionalValue).build());
+
+        assertThat(actualResult).containsExactlyInAnyOrderEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testPKIgnoredForInsert() {
+        String key = "key";
+        String value = "some_value";
+        String otherField = "other_field";
+        String otherValue = "other_value";
+
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(key, DataTypes.STRING()),
+                        DataTypes.FIELD(otherField, DataTypes.STRING()));
+        // A primary key is configured, but convertRowData (used for INSERT/UPDATE_AFTER) must still
+        // return the full item.
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType, List.of(key));
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(
+                        createElement(
+                                StringData.fromString(value), StringData.fromString(otherValue)));
+        Map<String, AttributeValue> expectedResult = new HashMap<>();
+        expectedResult.put(key, AttributeValue.builder().s(value).build());
+        expectedResult.put(otherField, AttributeValue.builder().s(otherValue).build());
+
+        assertThat(actualResult).containsExactlyInAnyOrderEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testPKIgnoredForUpdateAfter() {
+        // convertRowData is used for both INSERT and UPDATE_AFTER; verifying it returns the full
+        // item confirms the primary key is ignored for UPDATE_AFTER as well.
+        String key = "key";
+        String value = "some_value";
+        String otherField = "other_field";
+        String otherValue = "other_value";
+
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(key, DataTypes.STRING()),
+                        DataTypes.FIELD(otherField, DataTypes.STRING()));
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType, List.of(key, otherField));
+        Map<String, AttributeValue> actualResult =
+                rowDataToAttributeValueConverter.convertRowData(
+                        createElement(
+                                StringData.fromString(value), StringData.fromString(otherValue)));
+        Map<String, AttributeValue> expectedResult = new HashMap<>();
+        expectedResult.put(key, AttributeValue.builder().s(value).build());
+        expectedResult.put(otherField, AttributeValue.builder().s(otherValue).build());
+
+        assertThat(actualResult).containsExactlyInAnyOrderEntriesOf(expectedResult);
+    }
+
+    @Test
+    void testDeleteThrowsWhenPrimaryKeyValueIsMissing() {
+        String key = "key";
+        String otherField = "other_field";
+        String otherValue = "other_value";
+
+        DataType dataType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(key, DataTypes.STRING()),
+                        DataTypes.FIELD(otherField, DataTypes.STRING()));
+        // ignoreNulls drops null attributes, so a null primary key value is absent from the item.
+        RowDataToAttributeValueConverter rowDataToAttributeValueConverter =
+                new RowDataToAttributeValueConverter(dataType, List.of(key), true);
+
+        assertThatExceptionOfType(IllegalArgumentException.class)
+                .isThrownBy(
+                        () ->
+                                rowDataToAttributeValueConverter.convertRowDataToKey(
+                                        createElement(null, StringData.fromString(otherValue))))
+                .withMessageContaining("missing a value for the primary key attribute");
+    }
+
+    private RowData createElement(Object... values) {
+        final int valuesLength = values.length;
+        GenericRowData element = new GenericRowData(valuesLength);
+        IntStream.range(0, valuesLength).forEach(idx -> element.setField(idx, values[idx]));
         return element;
     }
 

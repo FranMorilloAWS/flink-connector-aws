@@ -85,6 +85,22 @@ public class KinesisSourceConfigOptions {
                     .defaultValue(ReaderType.POLLING)
                     .withDescription("The type of reader used to read from the Kinesis stream.");
 
+    public static final ConfigOption<Duration> READER_EMPTY_RECORDS_FETCH_INTERVAL =
+            ConfigOptions.key("source.reader.empty-records-fetch-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(250))
+                    .withDescription(
+                            "The interval to wait on a shard after a fetch returned no records "
+                                    + "before fetching from it again.");
+
+    public static final ConfigOption<Duration> READER_NON_EMPTY_RECORDS_FETCH_INTERVAL =
+            ConfigOptions.key("source.reader.nonempty-records-fetch-interval")
+                    .durationType()
+                    .defaultValue(Duration.ZERO)
+                    .withDescription(
+                            "The interval to wait on a shard after a fetch returned records "
+                                    + "before fetching from it again. Defaults to no interval.");
+
     public static final ConfigOption<ConsumerLifecycle> EFO_CONSUMER_LIFECYCLE =
             ConfigOptions.key("source.efo.lifecycle")
                     .enumType(ConsumerLifecycle.class)

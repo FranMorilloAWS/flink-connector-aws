@@ -55,10 +55,13 @@ import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.retries.AdaptiveRetryStrategy;
 import software.amazon.awssdk.retries.api.BackoffStrategy;
+import software.amazon.awssdk.retries.api.RetryStrategy;
+import software.amazon.awssdk.services.dynamodb.model.Shard;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 import software.amazon.awssdk.utils.AttributeMap;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,6 +69,8 @@ import java.util.function.Supplier;
 
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MAX_DELAY;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MIN_DELAY;
+import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS;
+import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_NON_EMPTY_POLLS;
 import static org.apache.flink.connector.dynamodb.source.config.DynamodbStreamsSourceConfigConstants.DYNAMODB_STREAMS_RETRY_COUNT;
 
 /**
@@ -133,13 +138,29 @@ public class DynamoDbStreamsSource<T>
         setUpDeserializationSchema(readerContext);
 
         Map<String, DynamoDbStreamsShardMetrics> shardMetricGroupMap = new ConcurrentHashMap<>();
+        // Delay between calling GetRecords API when last poll returned some records. Default - 250
+        // millis
+        final Duration getRecordsIdlePollingTimeBetweenNonEmptyPolls =
+                sourceConfig.get(DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_NON_EMPTY_POLLS);
 
+        // Delay between calling GetRecords API when last poll returned no records. Default - 1
+        // second
+        final Duration getRecordsIdlePollingTimeBetweenEmptyPolls =
+                sourceConfig.get(DYNAMODB_STREAMS_GET_RECORDS_IDLE_TIME_BETWEEN_EMPTY_POLLS);
+
+        Map<String, List<Shard>> childShardMap = new ConcurrentHashMap<>();
         // We create a new stream proxy for each split reader since they have their own independent
         // lifecycle.
         Supplier<PollingDynamoDbStreamsShardSplitReader> splitReaderSupplier =
                 () ->
                         new PollingDynamoDbStreamsShardSplitReader(
-                                createDynamoDbStreamsProxy(sourceConfig), shardMetricGroupMap);
+                                createDynamoDbStreamsProxy(
+                                        sourceConfig,
+                                        SdkDefaultRetryStrategy.defaultRetryStrategy()),
+                                getRecordsIdlePollingTimeBetweenNonEmptyPolls,
+                                getRecordsIdlePollingTimeBetweenEmptyPolls,
+                                childShardMap,
+                                shardMetricGroupMap);
         DynamoDbStreamsRecordEmitter<T> recordEmitter =
                 new DynamoDbStreamsRecordEmitter<>(deserializationSchema);
 
@@ -148,6 +169,7 @@ public class DynamoDbStreamsSource<T>
                 recordEmitter,
                 sourceConfig,
                 readerContext,
+                childShardMap,
                 shardMetricGroupMap);
     }
 
@@ -164,11 +186,24 @@ public class DynamoDbStreamsSource<T>
                     SplitEnumeratorContext<DynamoDbStreamsShardSplit> enumContext,
                     DynamoDbStreamsSourceEnumeratorState checkpoint)
                     throws Exception {
+        int maxApiCallAttempts = sourceConfig.get(DYNAMODB_STREAMS_RETRY_COUNT);
+        Duration minDelayBetweenRetries =
+                sourceConfig.get(DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MIN_DELAY);
+        Duration maxDelayBetweenRetries =
+                sourceConfig.get(DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MAX_DELAY);
+        BackoffStrategy backoffStrategy =
+                BackoffStrategy.exponentialDelay(minDelayBetweenRetries, maxDelayBetweenRetries);
+        AdaptiveRetryStrategy adaptiveRetryStrategy =
+                SdkDefaultRetryStrategy.adaptiveRetryStrategy().toBuilder()
+                        .maxAttempts(maxApiCallAttempts)
+                        .backoffStrategy(backoffStrategy)
+                        .throttlingBackoffStrategy(backoffStrategy)
+                        .build();
         return new DynamoDbStreamsSourceEnumerator(
                 enumContext,
                 streamArn,
                 sourceConfig,
-                createDynamoDbStreamsProxy(sourceConfig),
+                createDynamoDbStreamsProxy(sourceConfig, adaptiveRetryStrategy),
                 dynamoDbStreamsShardAssigner,
                 checkpoint);
     }
@@ -185,7 +220,8 @@ public class DynamoDbStreamsSource<T>
                 new DynamoDbStreamsShardSplitSerializer());
     }
 
-    private DynamoDbStreamsProxy createDynamoDbStreamsProxy(Configuration consumerConfig) {
+    private DynamoDbStreamsProxy createDynamoDbStreamsProxy(
+            Configuration consumerConfig, RetryStrategy retryStrategy) {
         SdkHttpClient httpClient =
                 AWSGeneralUtil.createSyncHttpClient(
                         AttributeMap.builder().build(), ApacheHttpClient.builder());
@@ -201,26 +237,12 @@ public class DynamoDbStreamsSource<T>
         consumerConfig.addAllToProperties(dynamoDbStreamsClientProperties);
 
         AWSGeneralUtil.validateAwsCredentials(dynamoDbStreamsClientProperties);
-        int maxApiCallAttempts = sourceConfig.get(DYNAMODB_STREAMS_RETRY_COUNT);
-        Duration minDescribeStreamDelay =
-                sourceConfig.get(DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MIN_DELAY);
-        Duration maxDescribeStreamDelay =
-                sourceConfig.get(DYNAMODB_STREAMS_EXPONENTIAL_BACKOFF_MAX_DELAY);
-        BackoffStrategy backoffStrategy =
-                BackoffStrategy.exponentialDelay(minDescribeStreamDelay, maxDescribeStreamDelay);
-        AdaptiveRetryStrategy adaptiveRetryStrategy =
-                SdkDefaultRetryStrategy.adaptiveRetryStrategy()
-                        .toBuilder()
-                        .maxAttempts(maxApiCallAttempts)
-                        .backoffStrategy(backoffStrategy)
-                        .throttlingBackoffStrategy(backoffStrategy)
-                        .build();
         DynamoDbStreamsClient dynamoDbStreamsClient =
                 AWSClientUtil.createAwsSyncClient(
                         dynamoDbStreamsClientProperties,
                         httpClient,
                         DynamoDbStreamsClient.builder(),
-                        ClientOverrideConfiguration.builder().retryStrategy(adaptiveRetryStrategy),
+                        ClientOverrideConfiguration.builder().retryStrategy(retryStrategy),
                         DynamodbStreamsSourceConfigConstants
                                 .BASE_DDB_STREAMS_USER_AGENT_PREFIX_FORMAT,
                         DynamodbStreamsSourceConfigConstants.DDB_STREAMS_CLIENT_USER_AGENT_PREFIX);

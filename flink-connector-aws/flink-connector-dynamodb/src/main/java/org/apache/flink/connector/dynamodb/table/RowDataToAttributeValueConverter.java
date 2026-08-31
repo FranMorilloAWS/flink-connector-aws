@@ -19,21 +19,30 @@
 package org.apache.flink.connector.dynamodb.table;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.connector.dynamodb.table.converter.ArrayAttributeConverter;
 import org.apache.flink.connector.dynamodb.table.converter.ArrayAttributeConverterProvider;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.conversion.DataStructureConverters;
+import org.apache.flink.table.types.CollectionDataType;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.KeyValueDataType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.types.Row;
 
+import software.amazon.awssdk.enhanced.dynamodb.AttributeConverter;
 import software.amazon.awssdk.enhanced.dynamodb.AttributeConverterProvider;
+import software.amazon.awssdk.enhanced.dynamodb.AttributeValueType;
 import software.amazon.awssdk.enhanced.dynamodb.EnhancedType;
 import software.amazon.awssdk.enhanced.dynamodb.TableSchema;
 import software.amazon.awssdk.enhanced.dynamodb.mapper.StaticTableSchema;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.IntStream;
 
 import static org.apache.flink.table.data.RowData.createFieldGetter;
 
@@ -43,21 +52,64 @@ public class RowDataToAttributeValueConverter {
 
     private final DataType physicalDataType;
     private final TableSchema<RowData> tableSchema;
+
+    /**
+     * Ordered primary key attribute names. Following DynamoDB's primary key definition, the first
+     * element is the partition key and the optional second element is the sort key. Used to build
+     * the key of a {@code DeleteRequest}, which must contain only the primary key attributes.
+     */
+    private final List<String> primaryKey;
+
     private boolean ignoreNulls = false;
 
     public RowDataToAttributeValueConverter(DataType physicalDataType) {
-        this.physicalDataType = physicalDataType;
-        this.tableSchema = createTableSchema();
+        this(physicalDataType, List.of(), false);
     }
 
     public RowDataToAttributeValueConverter(DataType physicalDataType, boolean ignoreNulls) {
+        this(physicalDataType, List.of(), ignoreNulls);
+    }
+
+    public RowDataToAttributeValueConverter(DataType physicalDataType, List<String> primaryKey) {
+        this(physicalDataType, primaryKey, false);
+    }
+
+    public RowDataToAttributeValueConverter(
+            DataType physicalDataType, List<String> primaryKey, boolean ignoreNulls) {
         this.physicalDataType = physicalDataType;
+        this.primaryKey = primaryKey;
         this.tableSchema = createTableSchema();
         this.ignoreNulls = ignoreNulls;
     }
 
     public Map<String, AttributeValue> convertRowData(RowData row) {
         return tableSchema.itemToMap(row, ignoreNulls);
+    }
+
+    /**
+     * Builds a map containing only the primary key attributes of the given row. This is used for
+     * {@code DELETE} requests, where DynamoDB requires the request to contain only the primary key
+     * (partition key and, if present, sort key) rather than the whole item.
+     *
+     * @param row the row to extract the primary key from
+     * @return a map of the primary key attribute names to their {@link AttributeValue}s
+     */
+    public Map<String, AttributeValue> convertRowDataToKey(RowData row) {
+        Map<String, AttributeValue> item = tableSchema.itemToMap(row, ignoreNulls);
+        Map<String, AttributeValue> key = new LinkedHashMap<>();
+        for (String keyAttributeName : primaryKey) {
+            AttributeValue value = item.get(keyAttributeName);
+            if (value == null) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "The row to delete is missing a value for the primary key "
+                                        + "attribute '%s'. A DELETE request must contain all "
+                                        + "primary key attributes.",
+                                keyAttributeName));
+            }
+            key.put(keyAttributeName, value);
+        }
+        return key;
     }
 
     private StaticTableSchema<RowData> createTableSchema() {
@@ -84,18 +136,63 @@ public class RowDataToAttributeValueConverter {
             DataTypes.Field field,
             RowData.FieldGetter fieldGetter) {
 
+        EnhancedType<Object> enhancedType = getEnhancedType(field.getDataType());
         return builder.addAttribute(
-                getEnhancedType(field.getDataType()),
-                a ->
-                        a.name(field.getName())
-                                .getter(
-                                        rowData ->
-                                                DataStructureConverters.getConverter(
-                                                                field.getDataType())
-                                                        .toExternalOrNull(
-                                                                fieldGetter.getFieldOrNull(
-                                                                        rowData)))
-                                .setter(((rowData, t) -> {})));
+                enhancedType,
+                a -> {
+                    a.name(field.getName())
+                            .getter(
+                                    rowData ->
+                                            DataStructureConverters.getConverter(
+                                                            field.getDataType())
+                                                    .toExternalOrNull(
+                                                            fieldGetter.getFieldOrNull(rowData)))
+                            .setter(((rowData, t) -> {}));
+                    buildRowAttributeConverter(field.getDataType())
+                            .ifPresent(a::attributeConverter);
+                });
+    }
+
+    private Optional<AttributeConverter> buildRowAttributeConverter(DataType dataType) {
+        if (LogicalTypeRoot.ROW == dataType.getLogicalType().getTypeRoot()) {
+            return Optional.of(createRowDocumentConverter(buildRowTableSchema(dataType)));
+        }
+        if (dataType instanceof CollectionDataType) {
+            DataType elementDataType = ((CollectionDataType) dataType).getElementDataType();
+            if (LogicalTypeRoot.ROW == elementDataType.getLogicalType().getTypeRoot()) {
+                AttributeConverter<Row> elementConverter =
+                        createRowDocumentConverter(buildRowTableSchema(elementDataType));
+                return Optional.of(
+                        new ArrayAttributeConverter<>(
+                                elementConverter, EnhancedType.of(Row[].class)));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static AttributeConverter<Row> createRowDocumentConverter(
+            TableSchema<Row> tableSchema) {
+        return new AttributeConverter<Row>() {
+            @Override
+            public AttributeValue transformFrom(Row input) {
+                return AttributeValue.builder().m(tableSchema.itemToMap(input, false)).build();
+            }
+
+            @Override
+            public Row transformTo(AttributeValue input) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public EnhancedType<Row> type() {
+                return EnhancedType.of(Row.class);
+            }
+
+            @Override
+            public AttributeValueType attributeValueType() {
+                return AttributeValueType.M;
+            }
+        };
     }
 
     private <T> EnhancedType<T> getEnhancedType(DataType dataType) {
@@ -104,8 +201,36 @@ public class RowDataToAttributeValueConverter {
                     EnhancedType.mapOf(
                             getEnhancedType(((KeyValueDataType) dataType).getKeyDataType()),
                             getEnhancedType(((KeyValueDataType) dataType).getValueDataType()));
+        } else if (LogicalTypeRoot.ROW == dataType.getLogicalType().getTypeRoot()) {
+            return (EnhancedType<T>) EnhancedType.of(Row.class);
         } else {
             return (EnhancedType<T>) EnhancedType.of(dataType.getConversionClass());
         }
+    }
+
+    private TableSchema<Row> buildRowTableSchema(DataType dataType) {
+        StaticTableSchema.Builder<Row> builder = TableSchema.builder(Row.class);
+        AttributeConverterProvider newAttributeConverterProvider =
+                new ArrayAttributeConverterProvider();
+        builder.attributeConverterProviders(
+                newAttributeConverterProvider, AttributeConverterProvider.defaultProvider());
+
+        final List<DataTypes.Field> fields = DataType.getFields(dataType);
+        IntStream.range(0, fields.size())
+                .forEach(
+                        idx -> {
+                            final DataTypes.Field field = fields.get(idx);
+                            final DataType fieldDataType = field.getDataType();
+                            builder.addAttribute(
+                                    getEnhancedType(fieldDataType),
+                                    a -> {
+                                        a.name(field.getName())
+                                                .getter(row -> row.getField(idx))
+                                                .setter((row, t) -> {});
+                                        buildRowAttributeConverter(fieldDataType)
+                                                .ifPresent(a::attributeConverter);
+                                    });
+                        });
+        return builder.build();
     }
 }

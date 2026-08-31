@@ -72,7 +72,6 @@ import software.amazon.awssdk.services.kinesis.model.DescribeStreamConsumerRespo
 import software.amazon.awssdk.services.kinesis.model.LimitExceededException;
 import software.amazon.awssdk.services.kinesis.model.Record;
 import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
-import software.amazon.awssdk.utils.AttributeMap;
 
 import java.time.Duration;
 import java.util.Map;
@@ -81,7 +80,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_CONSUMER_NAME;
-import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_CONSUMER_SUBSCRIPTION_TIMEOUT;
 import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_DESCRIBE_CONSUMER_RETRY_STRATEGY_MAX_ATTEMPTS_OPTION;
 import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_DESCRIBE_CONSUMER_RETRY_STRATEGY_MAX_DELAY_OPTION;
 import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_DESCRIBE_CONSUMER_RETRY_STRATEGY_MIN_DELAY_OPTION;
@@ -213,8 +211,8 @@ public class KinesisStreamsSource<T>
             Configuration sourceConfig, Map<String, KinesisShardMetrics> shardMetricGroupMap) {
         KinesisSourceConfigOptions.ReaderType readerType = sourceConfig.get(READER_TYPE);
         switch (readerType) {
-                // We create a new stream proxy for each split reader since they have their own
-                // independent lifecycle.
+            // We create a new stream proxy for each split reader since they have their own
+            // independent lifecycle.
             case POLLING:
                 return () ->
                         new PollingKinesisShardSplitReader(
@@ -228,7 +226,7 @@ public class KinesisStreamsSource<T>
                                 createKinesisAsyncStreamProxy(streamArn, sourceConfig),
                                 consumerArn,
                                 shardMetricGroupMap,
-                                sourceConfig.get(EFO_CONSUMER_SUBSCRIPTION_TIMEOUT));
+                                sourceConfig);
             default:
                 throw new IllegalArgumentException("Unsupported reader type: " + readerType);
         }
@@ -272,7 +270,7 @@ public class KinesisStreamsSource<T>
 
         SdkAsyncHttpClient asyncHttpClient =
                 AWSGeneralUtil.createAsyncHttpClient(
-                        AttributeMap.builder().build(), NettyNioAsyncHttpClient.builder());
+                        kinesisClientProperties, NettyNioAsyncHttpClient.builder());
         KinesisAsyncClient kinesisAsyncClient =
                 AWSClientUtil.createAwsAsyncClient(
                         kinesisClientProperties,

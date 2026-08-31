@@ -19,6 +19,7 @@
 package org.apache.flink.connector.kinesis.source.reader.fanout;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
 import org.apache.flink.connector.kinesis.source.metrics.KinesisShardMetrics;
 import org.apache.flink.connector.kinesis.source.proxy.AsyncStreamProxy;
@@ -31,6 +32,9 @@ import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+
+import static org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions.EFO_CONSUMER_SUBSCRIPTION_TIMEOUT;
 
 /**
  * An implementation of the KinesisShardSplitReader that consumes from Kinesis using Enhanced
@@ -41,6 +45,7 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
     private final AsyncStreamProxy asyncStreamProxy;
     private final String consumerArn;
     private final Duration subscriptionTimeout;
+    private final ScheduledThreadPoolExecutor timeoutScheduler;
 
     private final Map<String, FanOutKinesisShardSubscription> splitSubscriptions = new HashMap<>();
 
@@ -48,11 +53,20 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
             AsyncStreamProxy asyncStreamProxy,
             String consumerArn,
             Map<String, KinesisShardMetrics> shardMetricGroupMap,
-            Duration subscriptionTimeout) {
-        super(shardMetricGroupMap);
+            Configuration configuration) {
+        super(shardMetricGroupMap, configuration);
         this.asyncStreamProxy = asyncStreamProxy;
         this.consumerArn = consumerArn;
-        this.subscriptionTimeout = subscriptionTimeout;
+        this.subscriptionTimeout = configuration.get(EFO_CONSUMER_SUBSCRIPTION_TIMEOUT);
+        this.timeoutScheduler =
+                new ScheduledThreadPoolExecutor(
+                        1,
+                        r -> {
+                            Thread t = new Thread(r, "subscription-timeout-scheduler");
+                            t.setDaemon(true);
+                            return t;
+                        });
+        this.timeoutScheduler.setRemoveOnCancelPolicy(true);
     }
 
     @Override
@@ -68,6 +82,7 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
         boolean shardCompleted = event.continuationSequenceNumber() == null;
         if (shardCompleted) {
             splitSubscriptions.remove(splitState.getShardId());
+            subscription.close();
         }
         return new RecordBatch(event.records(), event.millisBehindLatest(), shardCompleted);
     }
@@ -82,7 +97,8 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
                             consumerArn,
                             split.getShardId(),
                             split.getStartingPosition(),
-                            subscriptionTimeout);
+                            subscriptionTimeout,
+                            timeoutScheduler);
             subscription.activateSubscription();
             splitSubscriptions.put(split.splitId(), subscription);
         }
@@ -90,6 +106,8 @@ public class FanOutKinesisShardSplitReader extends KinesisShardSplitReaderBase {
 
     @Override
     public void close() throws Exception {
+        splitSubscriptions.values().forEach(FanOutKinesisShardSubscription::close);
+        timeoutScheduler.shutdownNow();
         asyncStreamProxy.close();
     }
 }

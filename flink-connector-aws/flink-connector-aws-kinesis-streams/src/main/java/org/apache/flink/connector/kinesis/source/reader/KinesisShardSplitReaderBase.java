@@ -19,9 +19,11 @@
 package org.apache.flink.connector.kinesis.source.reader;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
+import org.apache.flink.connector.kinesis.source.config.KinesisSourceConfigOptions;
 import org.apache.flink.connector.kinesis.source.metrics.KinesisShardMetrics;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplit;
 import org.apache.flink.connector.kinesis.source.split.KinesisShardSplitState;
@@ -35,6 +37,7 @@ import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
@@ -44,6 +47,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 
 import static java.util.Collections.singleton;
 
@@ -60,8 +64,22 @@ public abstract class KinesisShardSplitReaderBase
     private final Set<String> pausedSplitIds = new HashSet<>();
     private final Map<String, KinesisShardMetrics> shardMetricGroupMap;
 
-    protected KinesisShardSplitReaderBase(Map<String, KinesisShardMetrics> shardMetricGroupMap) {
+    private final long emptyRecordsIntervalMillis;
+    private final long nonEmptyRecordsIntervalMillis;
+
+    private final Map<KinesisShardSplitState, Long> fetchDeferredUntil = new WeakHashMap<>();
+
+    protected KinesisShardSplitReaderBase(
+            Map<String, KinesisShardMetrics> shardMetricGroupMap, Configuration configuration) {
         this.shardMetricGroupMap = shardMetricGroupMap;
+        this.emptyRecordsIntervalMillis =
+                configuration
+                        .get(KinesisSourceConfigOptions.READER_EMPTY_RECORDS_FETCH_INTERVAL)
+                        .toMillis();
+        this.nonEmptyRecordsIntervalMillis =
+                configuration
+                        .get(KinesisSourceConfigOptions.READER_NON_EMPTY_RECORDS_FETCH_INTERVAL)
+                        .toMillis();
     }
 
     @Override
@@ -69,7 +87,12 @@ public abstract class KinesisShardSplitReaderBase
         KinesisShardSplitState splitState = assignedSplits.poll();
 
         // When there are no assigned splits, return quickly
-        if (splitState == null) {
+        if (skipWhenNoAssignedSplit(splitState)) {
+            return INCOMPLETE_SHARD_EMPTY_RECORDS;
+        }
+
+        if (skipWhileFetchDeferred(splitState)) {
+            assignedSplits.add(splitState);
             return INCOMPLETE_SHARD_EMPTY_RECORDS;
         }
 
@@ -82,6 +105,10 @@ public abstract class KinesisShardSplitReaderBase
         RecordBatch recordBatch;
         try {
             recordBatch = fetchRecords(splitState);
+            long deferIntervalMillis = getNextFetchDeferInterval(recordBatch);
+            if (deferIntervalMillis > 0) {
+                deferNextFetchBy(splitState, deferIntervalMillis);
+            }
         } catch (ResourceNotFoundException e) {
             LOG.warn(
                     "Failed to fetch records from shard {}: shard no longer exists. Marking split as complete",
@@ -123,6 +150,63 @@ public abstract class KinesisShardSplitReaderBase
                 recordBatch.getRecords().iterator(),
                 splitState.getSplitId(),
                 recordBatch.isCompleted());
+    }
+
+    private boolean skipWhenNoAssignedSplit(KinesisShardSplitState splitState) throws IOException {
+        if (splitState == null) {
+            try {
+                // Small sleep to prevent busy polling
+                Thread.sleep(1);
+                return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Sleep was interrupted while skipping no assigned split", e);
+            }
+        }
+
+        return false;
+    }
+
+    private boolean skipWhileFetchDeferred(KinesisShardSplitState splitState) throws IOException {
+        if (fetchDeferredUntil.containsKey(splitState)
+                && fetchDeferredUntil.get(splitState) > System.currentTimeMillis()) {
+            try {
+                // Small sleep to prevent busy polling
+                Thread.sleep(1);
+                return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Sleep was interrupted while skipping a deferred fetch", e);
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns how long the next fetch on the split should be deferred, based on whether the given
+     * batch returned records. Zero, the default for a non-empty batch, means the next fetch is not
+     * deferred and is performed at the first opportunity.
+     */
+    private long getNextFetchDeferInterval(RecordBatch recordBatch) {
+        boolean fetchWasEmpty = recordBatch == null || recordBatch.getRecords().isEmpty();
+        return fetchWasEmpty ? emptyRecordsIntervalMillis : nonEmptyRecordsIntervalMillis;
+    }
+
+    /**
+     * Defers the next fetch on the split until the given interval has elapsed. Until then, the
+     * fetcher thread will skip fetching (and have a small sleep) for the split.
+     */
+    private void deferNextFetchBy(KinesisShardSplitState splitState, long deferIntervalMillis) {
+        long deferredUntilMillis = System.currentTimeMillis() + deferIntervalMillis;
+        this.fetchDeferredUntil.put(splitState, deferredUntilMillis);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Deferring next fetch on split {} by {}ms until {}",
+                    splitState.getSplitId(),
+                    deferIntervalMillis,
+                    Instant.ofEpochMilli(deferredUntilMillis));
+        }
     }
 
     /**

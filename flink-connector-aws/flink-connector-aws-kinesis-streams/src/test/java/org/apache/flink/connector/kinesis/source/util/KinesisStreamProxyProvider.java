@@ -94,6 +94,8 @@ public class KinesisStreamProxyProvider {
         private final Map<String, Set<String>> efoConsumerRegistration = new HashMap<>();
         private final Set<String> consumersCurrentlyDeleting = new HashSet<>();
 
+        private int totalGetRecordsCall = 0;
+
         @Override
         public StreamDescriptionSummary getStreamDescriptionSummary(String streamArn) {
             return StreamDescriptionSummary.builder()
@@ -137,6 +139,7 @@ public class KinesisStreamProxyProvider {
                 String shardId,
                 StartingPosition startingPosition,
                 int maxRecordsToGet) {
+            totalGetRecordsCall++;
             ShardHandle shardHandle = new ShardHandle(streamArn, shardId);
 
             if (getRecordsExceptionSupplier != null) {
@@ -272,8 +275,7 @@ public class KinesisStreamProxyProvider {
 
         private String getConsumerArnFromName(String consumerName) {
             Arn streamArn = Arn.fromString(STREAM_ARN);
-            return streamArn
-                    .toBuilder()
+            return streamArn.toBuilder()
                     .resource(
                             streamArn.resourceAsString()
                                     + "/consumer/"
@@ -348,6 +350,10 @@ public class KinesisStreamProxyProvider {
 
         public boolean isClosed() {
             return closed;
+        }
+
+        public int getTotalGetRecordsCall() {
+            return totalGetRecordsCall;
         }
 
         private static class ShardHandle {
